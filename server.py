@@ -269,6 +269,5 @@ if __name__ == "__main__":
     else:
         logger.warning("DATABASE_URL not set — saves disabled.")
 
-    port = int(os.environ.get("PORT", 8000))
-    logger.info("Listening on 0.0.0.0:%d", port)
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    logger.info("Listening on 0.0.0.0:%s", os.environ.get("PORT", "8000"))
+    mcp.run(transport="sse")
