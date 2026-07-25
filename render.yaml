@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: dcss-mcp
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: dcss-saves
+          property: connectionString
+      - key: PORT
+        value: "8000"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: DCSS_SAVE_DIR
+        value: /tmp/dcss-saves
+
+databases:
+  - name: dcss-saves
+    plan: free
+    databaseName: dcss_mcp
+    ipAllowList: []  # allow only from same Render account services
