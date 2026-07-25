@@ -14,7 +14,11 @@ Tools:
 """
 
 import os
+import sys
 import asyncio
+import signal
+import atexit
+import time
 import logging
 from mcp.server.fastmcp import FastMCP
 
@@ -217,33 +221,42 @@ async def game_status() -> str:
     except Exception as exc:
         return f"DCSS is RUNNING but screen read error: {exc}"
 
-# ── Graceful shutdown — save game, then close DB ──────────────────────
+# ── Graceful shutdown — save game on SIGTERM ─────────────────────────
 
 
-@mcp.on_shutdown()
-async def shutdown():
-    """Save the current game before the server stops."""
-    if engine.is_running:
-        logger.info("Shutdown: saving game to 'latest'...")
-        try:
-            engine.send_keys("S")
-            await asyncio.sleep(1.5)
-            engine.send_keys("y")
-            await asyncio.sleep(1.0)
-            if engine.is_running:
-                engine.send_keys("Q")
-                await asyncio.sleep(0.5)
-            engine.wait_for_exit(timeout=4.0)
-            files = engine.collect_save_files()
-            if files:
-                pg.store("latest", files)
-                logger.info("Shutdown save complete.")
-        except Exception as exc:
-            logger.error("Shutdown save failed: %s", exc)
+@atexit.register
+def _save_on_exit():
+    """Best-effort save when the server stops."""
+    if not engine.is_running:
+        return
+    try:
+        logger.info("Shutdown: saving game...")
+        engine.send_keys("S")
+        time.sleep(1.5)
+        engine.send_keys("y")
+        time.sleep(1.0)
+        if engine.is_running:
+            engine.send_keys("Q")
+            time.sleep(1.0)
+        engine.wait_for_exit(timeout=4.0)
+        files = engine.collect_save_files()
+        if files:
+            pg.store("latest", files)
+            logger.info("Shutdown save complete.")
+    except Exception as exc:
+        logger.error("Shutdown save failed: %s", exc)
+    finally:
+        engine.stop()
+        pg.close()
 
-    engine.stop()
-    pg.close()
-    logger.info("DCSS MCP Server stopped.")
+
+def _sigterm(signum, frame):
+    """SIGTERM → sys.exit → atexit handler runs above."""
+    logger.warning("SIGTERM — saving and shutting down ...")
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _sigterm)
 
 # ── Entry point ────────────────────────────────────────────────────────
 
