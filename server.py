@@ -269,5 +269,10 @@ if __name__ == "__main__":
     else:
         logger.warning("DATABASE_URL not set — saves disabled.")
 
-    logger.info("Listening on 0.0.0.0:%s", os.environ.get("PORT", "8000"))
-    mcp.run(transport="sse")
+    port = int(os.environ.get("PORT", 8000))
+    logger.info("Listening on 0.0.0.0:%d", port)
+
+    # Use uvicorn directly (mcp.run() binds to 127.0.0.1:8000 which fails on Render)
+    import uvicorn
+    app = mcp.sse_app()
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
