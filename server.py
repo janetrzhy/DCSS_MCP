@@ -31,13 +31,6 @@ mcp = FastMCP("DCSS Game Server")
 engine = DcssEngine()
 pg = PgStore()
 
-# ── Health endpoint (used by Render health checks) ────────────────────
-
-
-@mcp.get("/health")
-async def health():
-    return {"status": "ok", "game_running": engine.is_running, "db_connected": pg.available}
-
 # ── Tools ─────────────────────────────────────────────────────────────
 
 
