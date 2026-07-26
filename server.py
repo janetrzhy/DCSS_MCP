@@ -368,6 +368,7 @@ async def server_info() -> str:
         f"Render instance: {os.environ.get('RENDER_INSTANCE_ID', '?')}",
         f"Backend: {diag.get('backend', '?')}",
         f"DCSS binary: {diag['binary']}",
+        f"DCSS data dir: {diag.get('crawl_dir', '?')} exists={diag.get('crawl_dir_exists', '?')}",
         f"DCSS binary realpath: {diag['binary_realpath']}",
         f"DCSS binary exists/executable: {diag['binary_exists']}/{diag['binary_executable']}",
         f"tmux: {diag.get('tmux_binary', '?')} exists={diag.get('tmux_exists', '?')} session={diag.get('session', '?')}",

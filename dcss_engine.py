@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 DCSS_BINARY = os.environ.get("DCSS_BINARY", "/usr/games/crawl")
+CRAWL_DIR = Path(os.environ.get("CRAWL_DIR", "/usr/share/crawl"))
 TMUX_BINARY = os.environ.get("TMUX_BINARY", "/usr/bin/tmux")
 TMUX_SESSION = os.environ.get("DCSS_TMUX_SESSION", "dcss")
 SAVE_DIR = Path(os.environ.get("DCSS_SAVE_DIR", "/tmp/dcss-saves"))
@@ -150,6 +151,8 @@ class DcssEngine:
             "child_pid": None,
             "master_fd": None,
             "binary": DCSS_BINARY,
+            "crawl_dir": str(CRAWL_DIR),
+            "crawl_dir_exists": CRAWL_DIR.exists(),
             "binary_realpath": os.path.realpath(DCSS_BINARY),
             "binary_exists": crawl.exists(),
             "binary_executable": os.access(crawl, os.X_OK),
@@ -177,7 +180,7 @@ class DcssEngine:
             (
                 f"env HOME={_sh(HOME_DIR)} TERM={_sh(DCSS_TERM)} "
                 f"LINES={ROWS} COLUMNS={COLS} DCSS_SAVE_DIR={_sh(SAVE_DIR)} "
-                f"{_sh(DCSS_BINARY)}"
+                f"{_sh(DCSS_BINARY)} -dir {_sh(CRAWL_DIR)}"
             ),
         ]
         parts[-1] += "".join(f" {_sh(arg)}" for arg in extra_args)
@@ -190,6 +193,8 @@ class DcssEngine:
             raise FileNotFoundError(f"DCSS binary does not exist: {DCSS_BINARY!r}")
         if not os.access(DCSS_BINARY, os.X_OK):
             raise PermissionError(f"DCSS binary is not executable: {DCSS_BINARY!r}")
+        if not CRAWL_DIR.exists():
+            raise FileNotFoundError(f"DCSS data directory does not exist: {str(CRAWL_DIR)!r}")
 
     def _ensure_home_config(self) -> None:
         crawl_dir = HOME_DIR / ".crawl"
