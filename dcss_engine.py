@@ -181,7 +181,7 @@ class DcssEngine:
         crawl = (
             f"env HOME={_sh(HOME_DIR)} TERM={_sh(DCSS_TERM)} "
             f"LINES={ROWS} COLUMNS={COLS} DCSS_SAVE_DIR={_sh(SAVE_DIR)} "
-            f"{_sh(DCSS_BINARY)} -dir {_sh(CRAWL_DIR)}"
+            f"{_sh(DCSS_BINARY)}"
         )
         crawl += "".join(f" {_sh(arg)}" for arg in extra_args)
         parts = [
