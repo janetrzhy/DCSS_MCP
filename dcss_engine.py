@@ -66,6 +66,7 @@ class DcssEngine:
         # pyte terminal emulator
         self._screen = pyte.Screen(COLS, ROWS)
         self._stream = pyte.Stream(self._screen)
+        self._raw_tail = ""
 
         # ensure directories
         HOME_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,6 +147,29 @@ class DcssEngine:
         """Return the current emulated terminal screen as plain text."""
         self._drain_output()
         return self._display_text()
+
+    def diagnostics(self) -> dict:
+        """Return lightweight runtime diagnostics for MCP status/debug output."""
+        binary = Path(DCSS_BINARY)
+        screen = self._display_text()
+        return {
+            "is_running": self.is_running,
+            "child_pid": self.child_pid,
+            "master_fd": self.master_fd,
+            "binary": DCSS_BINARY,
+            "binary_realpath": os.path.realpath(DCSS_BINARY),
+            "binary_exists": binary.exists(),
+            "binary_executable": os.access(binary, os.X_OK),
+            "term": DCSS_TERM,
+            "rows": ROWS,
+            "cols": COLS,
+            "home": str(HOME_DIR),
+            "save_dir": str(self._resolve_save_dir()),
+            "screen_chars": len(screen),
+            "screen_nonblank_chars": len(screen.strip()),
+            "raw_tail_chars": len(self._raw_tail),
+            "raw_tail_preview": self._raw_tail[-600:],
+        }
 
     def wait_for_stable(self, timeout: float = 6.0) -> str:
         """Wait until screen output stabilises (no changes for SCREEN_STABLE_SEC)."""
@@ -298,7 +322,9 @@ class DcssEngine:
                 data = os.read(self.master_fd, 8192)
                 if not data:
                     break
-                self._stream.feed(data.decode("utf-8", errors="replace"))
+                decoded = data.decode("utf-8", errors="replace")
+                self._raw_tail = (self._raw_tail + decoded)[-4000:]
+                self._stream.feed(decoded)
             except (OSError, ValueError):
                 break
 

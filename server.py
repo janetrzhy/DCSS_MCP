@@ -32,6 +32,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server")
 
+SERVER_VERSION = "2026-07-26-pty-debug-v1"
+DEPLOY_COMMIT = (
+    os.environ.get("RENDER_GIT_COMMIT")
+    or os.environ.get("RENDER_COMMIT")
+    or os.environ.get("GIT_COMMIT")
+    or "local"
+)
+
 MCP_INSTRUCTIONS = """
 This MCP server lets the assistant play Dungeon Crawl Stone Soup through tools.
 To begin a run, call start_game() first. After that, repeatedly call
@@ -113,6 +121,23 @@ async def _start_game_impl(
     return screen
 
 
+def _screen_or_blank_diagnostic(screen: str) -> str:
+    if screen.strip():
+        return screen
+    diag = engine.diagnostics()
+    lines = [
+        "SCREEN BLANK - DCSS process is running but pyte rendered no visible terminal cells.",
+        f"server_version={SERVER_VERSION} commit={DEPLOY_COMMIT}",
+        f"pid={diag['child_pid']} fd={diag['master_fd']} TERM={diag['term']} size={diag['cols']}x{diag['rows']}",
+        f"binary={diag['binary']} realpath={diag['binary_realpath']}",
+        f"raw_tail_chars={diag['raw_tail_chars']}",
+    ]
+    if diag["raw_tail_preview"]:
+        lines.append("raw_tail_preview:")
+        lines.append(diag["raw_tail_preview"])
+    return "\n".join(lines)
+
+
 @mcp.tool(
     description=(
         "Read the current DCSS game screen as ASCII text (80x24 terminal). "
@@ -123,7 +148,7 @@ async def _start_game_impl(
 async def read_screen() -> str:
     if not engine.is_running:
         return "NO GAME RUNNING — use start_game(), start_new_game(), or load_game() first."
-    return engine.read_screen()
+    return _screen_or_blank_diagnostic(engine.read_screen())
 
 
 @mcp.tool(
@@ -140,11 +165,11 @@ async def send_keys(keys: str = "") -> str:
     if not engine.is_running:
         return "NO GAME RUNNING — use start_game(), start_new_game(), or load_game() first."
     if not keys:
-        return engine.read_screen()
+        return _screen_or_blank_diagnostic(engine.read_screen())
     try:
         engine.send_keys(_normalize_keys(keys))
         screen = engine.wait_for_stable(timeout=2.0)
-        return screen
+        return _screen_or_blank_diagnostic(screen)
     except Exception as exc:
         logger.exception("send_keys failed")
         return f"ERROR: {exc}"
@@ -177,7 +202,7 @@ async def start_game(
             background=background,
             weapon=weapon,
         )
-        return screen
+        return _screen_or_blank_diagnostic(screen)
     except Exception as exc:
         logger.exception("start_game failed")
         return f"ERROR starting game: {exc}"
@@ -321,18 +346,64 @@ async def delete_save(slot: str) -> str:
 
 
 @mcp.tool(
+    description=(
+        "Return server version, deployed commit, transport/runtime settings, "
+        "and DCSS engine diagnostics. Use this to verify which Render deploy "
+        "the MCP client is actually connected to."
+    )
+)
+async def server_info() -> str:
+    diag = engine.diagnostics()
+    lines = [
+        f"DCSS MCP server version: {SERVER_VERSION}",
+        f"Deploy commit: {DEPLOY_COMMIT}",
+        f"Render service: {os.environ.get('RENDER_SERVICE_NAME', '?')}",
+        f"Render instance: {os.environ.get('RENDER_INSTANCE_ID', '?')}",
+        f"DCSS binary: {diag['binary']}",
+        f"DCSS binary realpath: {diag['binary_realpath']}",
+        f"DCSS binary exists/executable: {diag['binary_exists']}/{diag['binary_executable']}",
+        f"TERM: {diag['term']}  size: {diag['cols']}x{diag['rows']}",
+        f"Running: {diag['is_running']}  pid: {diag['child_pid']}  fd: {diag['master_fd']}",
+        f"Screen nonblank chars: {diag['screen_nonblank_chars']}  raw tail chars: {diag['raw_tail_chars']}",
+    ]
+    if diag["raw_tail_preview"]:
+        lines.append("Raw tail preview:")
+        lines.append(diag["raw_tail_preview"])
+    return "\n".join(lines)
+
+
+@mcp.tool(
     description="Quick check whether DCSS is running and responding."
 )
 async def game_status() -> str:
+    prefix = f"DCSS MCP {SERVER_VERSION} commit={DEPLOY_COMMIT}\n"
+    diag = engine.diagnostics()
     if not engine.is_running:
-        return "DCSS is NOT running."
+        return (
+            prefix
+            + "DCSS is NOT running.\n"
+            + f"binary={diag['binary']} realpath={diag['binary_realpath']} "
+            + f"exists/executable={diag['binary_exists']}/{diag['binary_executable']} "
+            + f"TERM={diag['term']} size={diag['cols']}x{diag['rows']}"
+        )
     try:
         screen = engine.read_screen()
+        diag = engine.diagnostics()
         if len(screen) > 300:
-            return f"DCSS is RUNNING.\n(Preview)\n{screen[:300]}..."
-        return f"DCSS is RUNNING.\n{screen}"
+            return (
+                prefix
+                + f"DCSS is RUNNING. pid={diag['child_pid']} "
+                + f"screen_nonblank={diag['screen_nonblank_chars']} raw_tail={diag['raw_tail_chars']}\n"
+                + f"(Preview)\n{screen[:300]}..."
+            )
+        return (
+            prefix
+            + f"DCSS is RUNNING. pid={diag['child_pid']} "
+            + f"screen_nonblank={diag['screen_nonblank_chars']} raw_tail={diag['raw_tail_chars']}\n"
+            + screen
+        )
     except Exception as exc:
-        return f"DCSS is RUNNING but screen read error: {exc}"
+        return prefix + f"DCSS is RUNNING but screen read error: {exc}"
 
 # ── Graceful shutdown — save game on SIGTERM ─────────────────────────
 
@@ -403,6 +474,8 @@ if __name__ == "__main__":
         return JSONResponse({
             "ok": True,
             "name": "DCSS Game Server",
+            "version": SERVER_VERSION,
+            "commit": DEPLOY_COMMIT,
             "mcp": "/mcp",
             "sse": "/sse",
             "tools": [
@@ -414,6 +487,7 @@ if __name__ == "__main__":
                 "load_game",
                 "list_saves",
                 "delete_save",
+                "server_info",
                 "game_status",
             ],
         })
