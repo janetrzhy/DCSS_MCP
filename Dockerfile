@@ -18,8 +18,13 @@ RUN curl -sL -o /tmp/dcss.AppImage \
     && cd /tmp \
     && ./dcss.AppImage --appimage-extract > /dev/null 2>&1 \
     && mv squashfs-root /opt/dcss \
-    && ln -s /opt/dcss/AppRun /usr/local/bin/crawl \
+    && test -x /opt/dcss/usr/bin/crawl \
+    && printf '#!/bin/sh\nexec /opt/dcss/usr/bin/crawl "$@"\n' > /usr/local/bin/crawl \
+    && chmod +x /usr/local/bin/crawl \
+    && /usr/local/bin/crawl -version \
     && rm -f /tmp/dcss.AppImage
+
+ENV DCSS_BINARY=/usr/local/bin/crawl
 
 WORKDIR /app
 

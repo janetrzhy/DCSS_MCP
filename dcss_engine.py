@@ -80,6 +80,7 @@ class DcssEngine:
                 "DCSS engine requires a Linux/POSIX pty. "
                 f"Run it in Docker or on Linux. Import error: {POSIX_PTY_ERROR}"
             )
+        self._validate_binary()
 
         if self.is_running:
             self.stop()
@@ -98,7 +99,14 @@ class DcssEngine:
             # wait for first screen draw
             self.wait_for_stable()
             if self._poll_child_exit():
-                raise RuntimeError(f"DCSS exited immediately. Check DCSS_BINARY={DCSS_BINARY!r}.")
+                screen = self._display_text().strip()
+                detail = (
+                    f"DCSS exited immediately. DCSS_BINARY={DCSS_BINARY!r}, "
+                    f"realpath={os.path.realpath(DCSS_BINARY)!r}."
+                )
+                if screen:
+                    detail += f"\nLast terminal output:\n{screen}"
+                raise RuntimeError(detail)
             logger.info("DCSS started (pid=%d).", pid)
 
     def stop(self) -> None:
@@ -222,13 +230,29 @@ class DcssEngine:
 
         args = [DCSS_BINARY, "-ascii"]
         args.extend(extra_args)
-        os.execv(DCSS_BINARY, args)
-        # if exec fails:
-        os._exit(1)  # noqa
+        try:
+            os.execv(DCSS_BINARY, args)
+        except OSError as exc:
+            print(
+                f"exec failed for {DCSS_BINARY!r} "
+                f"(realpath={os.path.realpath(DCSS_BINARY)!r}): {exc}",
+                flush=True,
+            )
+            os._exit(127)  # noqa
 
     def _resolve_save_dir(self) -> Path:
         """DCSS saves inside ~/.crawl/saves/ by default."""
         return HOME_DIR / ".crawl" / "saves"
+
+    def _validate_binary(self) -> None:
+        binary = Path(DCSS_BINARY)
+        if not binary.exists():
+            raise FileNotFoundError(
+                f"DCSS binary does not exist: {DCSS_BINARY!r} "
+                f"(realpath={os.path.realpath(DCSS_BINARY)!r})."
+            )
+        if not os.access(binary, os.X_OK):
+            raise PermissionError(f"DCSS binary is not executable: {DCSS_BINARY!r}.")
 
     def _ensure_home_config(self) -> None:
         """Write a minimal crawl init for stable ASCII terminal output."""
