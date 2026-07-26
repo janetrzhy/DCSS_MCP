@@ -228,7 +228,7 @@ class DcssEngine:
         os.environ["TERM"] = "xterm-256color"
         os.environ["DCSS_SAVE_DIR"] = str(SAVE_DIR)
 
-        args = [DCSS_BINARY, "-ascii"]
+        args = [DCSS_BINARY]
         args.extend(extra_args)
         try:
             os.execv(DCSS_BINARY, args)
