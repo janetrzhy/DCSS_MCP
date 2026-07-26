@@ -5,9 +5,9 @@
 ## 架构
 
 ```
-claude.ai / GPT Chat         Render Cloud
+claude.ai / ChatGPT          Render Cloud
 ┌──────────────┐             ┌─────────────────────┐
-│  MCP Client  │◄──SSE──►    │  DCSS MCP Server    │
+│  MCP Client  │◄─HTTP/SSE─► │  DCSS MCP Server    │
 │  (你)        │             │  ├─ pty → crawl     │
 └──────────────┘             │  └─ PostgreSQL(save) │
                              └─────────────────────┘
@@ -38,7 +38,18 @@ claude.ai / GPT Chat         Render Cloud
    - **PostgreSQL** — 存存档（免费 tier，256MB）
 5. 部署完成后，复制你的 **Service URL**（如 `https://dcss-mcp.onrender.com`）
 
-### claude.ai 连接配置
+### ChatGPT / 官方 MCP 连接配置
+
+优先使用新版 Streamable HTTP 入口：
+
+```text
+https://你的render域名.onrender.com/mcp
+```
+
+连接成功后，让 ChatGPT 调用 `start_game()`，它会直接启动一个默认开局；之后用
+`read_screen()` / `send_keys()` 读取屏幕和操作游戏。
+
+### Claude / 旧 SSE 连接配置
 
 在 Claude **Settings → Developer → MCP Servers** 中添加：
 
@@ -52,17 +63,20 @@ claude.ai / GPT Chat         Render Cloud
 }
 ```
 
-### GPT Chat 连接配置
+旧版 SSE 入口仍保留：
 
-在 ChatGPT 的 **Custom GPT → Actions** 配置中，MCP Server URL 填入同上。
+```text
+https://你的render域名.onrender.com/sse
+```
 
 ## MCP Tools
 
 | Tool | 描述 |
 |------|------|
+| `start_game(auto_play=true)` | 开始新游戏，默认自动选 Play 进入默认开局 |
 | `read_screen()` | 读取当前 DCSS 屏幕内容（80×24 纯文本） |
-| `send_keys(keys)` | 发送按键，返回更新后的屏幕 |
-| `start_new_game()` | 开始新游戏（到主菜单） |
+| `send_keys(keys)` | 发送按键，返回更新后的屏幕；支持 `Tab`、`Space`、`Enter` 这类可读按键名 |
+| `start_new_game(auto_play=true)` | `start_game` 的兼容别名 |
 | `save_game(slot)` | 保存当前游戏到 PostgreSQL（支持分支存档） |
 | `load_game(slot)` | 从 PostgreSQL 恢复存档 |
 | `list_saves()` | 列出所有存档 |
@@ -74,13 +88,12 @@ claude.ai / GPT Chat         Render Cloud
 AI 的典型游戏循环：
 
 ```
-1. start_new_game()      → 看到主菜单
-2. send_keys("P")        → 选 Play（默认 MiBe）
-3. send_keys("o")        → 自动探索 D:1
-4. read_screen()         → 看发生了什么
-5. send_keys("Tab")      → 攻击敌人
-6. 当危险时 save_game("before_lair") → 存档保平安
-7. 死了就 load_game("before_lair")   → 读档重来
+1. start_game()          → 默认开局，进入可操作游戏
+2. send_keys("o")        → 自动探索 D:1
+3. read_screen()         → 看发生了什么
+4. send_keys("Tab")      → 攻击敌人
+5. 当危险时 save_game("before_lair") → 存档保平安
+6. 死了就 load_game("before_lair")   → 读档重来
 ```
 
 ### 推荐种族/职业

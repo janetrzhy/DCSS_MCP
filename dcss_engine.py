@@ -18,20 +18,29 @@ Save/restore life cycle:
 """
 
 import os
-import pty
-import select
 import signal
-import struct
-import fcntl
-import termios
 import time
 import logging
+import shutil
 from pathlib import Path
 from typing import NoReturn
 
 import pyte
 
 logger = logging.getLogger(__name__)
+
+try:
+    import pty
+    import select
+    import struct
+    import fcntl
+    import termios
+
+    POSIX_PTY_AVAILABLE = True
+    POSIX_PTY_ERROR: Exception | None = None
+except (ImportError, ModuleNotFoundError) as exc:
+    POSIX_PTY_AVAILABLE = False
+    POSIX_PTY_ERROR = exc
 
 DCSS_BINARY = os.environ.get("DCSS_BINARY", "/usr/local/bin/crawl")
 SAVE_DIR = Path(os.environ.get("DCSS_SAVE_DIR", "/tmp/dcss-saves"))
@@ -60,11 +69,18 @@ class DcssEngine:
         # ensure directories
         HOME_DIR.mkdir(parents=True, exist_ok=True)
         SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        self._ensure_home_config()
 
     # ── life cycle ──────────────────────────────────────────────────────
 
     def start(self, *extra_args: str) -> None:
         """Spawn crawl in a pty."""
+        if not POSIX_PTY_AVAILABLE:
+            raise RuntimeError(
+                "DCSS engine requires a Linux/POSIX pty. "
+                f"Run it in Docker or on Linux. Import error: {POSIX_PTY_ERROR}"
+            )
+
         if self.is_running:
             self.stop()
 
@@ -81,6 +97,8 @@ class DcssEngine:
             self.is_running = True
             # wait for first screen draw
             self.wait_for_stable()
+            if self._poll_child_exit():
+                raise RuntimeError(f"DCSS exited immediately. Check DCSS_BINARY={DCSS_BINARY!r}.")
             logger.info("DCSS started (pid=%d).", pid)
 
     def stop(self) -> None:
@@ -171,7 +189,10 @@ class DcssEngine:
         save_path = self._resolve_save_dir()
         if save_path.exists():
             for p in save_path.iterdir():
-                p.unlink(missing_ok=True)
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink(missing_ok=True)
 
     def wait_for_exit(self, timeout: float = 5.0) -> bool:
         """Wait for the DCSS process to exit.  Returns True if it exited."""
@@ -209,6 +230,34 @@ class DcssEngine:
         """DCSS saves inside ~/.crawl/saves/ by default."""
         return HOME_DIR / ".crawl" / "saves"
 
+    def _ensure_home_config(self) -> None:
+        """Write a minimal crawl init for stable ASCII terminal output."""
+        crawl_dir = HOME_DIR / ".crawl"
+        crawl_dir.mkdir(parents=True, exist_ok=True)
+        init_file = crawl_dir / "init.txt"
+        if not init_file.exists():
+            init_file.write_text(
+                "\n".join([
+                    "tile_display_mode = ascii",
+                    "",
+                ]),
+                encoding="utf-8",
+            )
+
+    def _poll_child_exit(self) -> bool:
+        """Return True and reset state if the crawl child has exited."""
+        if self.child_pid is None:
+            return False
+        try:
+            wpid, _status = os.waitpid(self.child_pid, os.WNOHANG)
+            if wpid == self.child_pid:
+                self._reset_state()
+                return True
+        except ChildProcessError:
+            self._reset_state()
+            return True
+        return False
+
     def _drain_output(self) -> None:
         """Read all pending bytes from the pty and feed them to pyte."""
         if self.master_fd is None:
@@ -236,6 +285,11 @@ class DcssEngine:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
 
     def _reset_state(self) -> None:
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
         self.is_running = False
         self.master_fd = None
         self.child_pid = None

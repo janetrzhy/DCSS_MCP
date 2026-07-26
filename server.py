@@ -1,16 +1,17 @@
-"""DCSS MCP Server — expose Dungeon Crawl Stone Soup as SSE-based MCP tools.
+"""DCSS MCP Server — expose Dungeon Crawl Stone Soup as MCP tools.
 
-claude.ai / GPT Chat  ←→  SSE  ←→  this server  ←→  pty  ←→  crawl
+claude.ai / ChatGPT  <->  Streamable HTTP or SSE  <->  pty  <->  crawl
 
 Tools:
-  read_screen()    — current 80×24 terminal content
-  send_keys(str)   — keystrokes to game
-  start_new_game() — fresh character
-  save_game(slot)  — checkpoint to PostgreSQL
-  load_game(slot)  — restore checkpoint
-  list_saves()     — available checkpoints
-  delete_save()    — remove a checkpoint
-  game_status()    — is DCSS alive?
+  start_game()     - fresh game, ready to play
+  read_screen()    - current 80x24 terminal content
+  send_keys(str)   - keystrokes to game
+  start_new_game() - compatibility alias
+  save_game(slot)  - checkpoint to PostgreSQL
+  load_game(slot)  - restore checkpoint
+  list_saves()     - available checkpoints
+  delete_save()    - remove a checkpoint
+  game_status()    - is DCSS alive?
 """
 
 import os
@@ -31,11 +32,72 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server")
 
-mcp = FastMCP("DCSS Game Server")
+MCP_INSTRUCTIONS = """
+This MCP server lets the assistant play Dungeon Crawl Stone Soup through tools.
+To begin a run, call start_game() first. After that, repeatedly call
+read_screen() and send_keys(keys) to inspect the terminal and act in game.
+Do not merely explain the controls when the user asks to play; use the tools.
+"""
+
+mcp = FastMCP("DCSS Game Server", instructions=MCP_INSTRUCTIONS)
 engine = DcssEngine()
 pg = PgStore()
 
 # ── Tools ─────────────────────────────────────────────────────────────
+
+SPECIAL_KEY_TOKENS = {
+    "Backspace": "\x7f",
+    "Escape": "\x1b",
+    "Return": "\r",
+    "Enter": "\r",
+    "Space": " ",
+    "Esc": "\x1b",
+    "Tab": "\t",
+    "\\t": "\t",
+    "\\n": "\r",
+}
+
+
+def _normalize_keys(keys: str) -> str:
+    """Allow model-friendly key names such as TabTab, Space, and Enter."""
+    if not keys:
+        return ""
+
+    tokens = sorted(SPECIAL_KEY_TOKENS, key=len, reverse=True)
+    out: list[str] = []
+    i = 0
+    while i < len(keys):
+        matched = False
+        for token in tokens:
+            wrapped = f"<{token}>"
+            if keys.startswith(wrapped, i):
+                out.append(SPECIAL_KEY_TOKENS[token])
+                i += len(wrapped)
+                matched = True
+                break
+            if keys.startswith(token, i):
+                out.append(SPECIAL_KEY_TOKENS[token])
+                i += len(token)
+                matched = True
+                break
+        if not matched:
+            out.append(keys[i])
+            i += 1
+    return "".join(out)
+
+
+async def _start_game_impl(auto_play: bool = True) -> str:
+    """Start crawl and optionally choose the default Play menu item."""
+    engine.stop()
+    engine.clean_save_files()
+    engine.start()
+    screen = engine.wait_for_stable(timeout=6.0)
+
+    if auto_play:
+        engine.send_keys("P")
+        screen = engine.wait_for_stable(timeout=8.0)
+
+    return screen
 
 
 @mcp.tool(
@@ -47,7 +109,7 @@ pg = PgStore()
 )
 async def read_screen() -> str:
     if not engine.is_running:
-        return "NO GAME RUNNING — use start_new_game() to begin, or load_game() to restore a save."
+        return "NO GAME RUNNING — use start_game(), start_new_game(), or load_game() first."
     return engine.read_screen()
 
 
@@ -63,11 +125,11 @@ async def read_screen() -> str:
 )
 async def send_keys(keys: str = "") -> str:
     if not engine.is_running:
-        return "NO GAME RUNNING — use start_new_game() or load_game() first."
+        return "NO GAME RUNNING — use start_game(), start_new_game(), or load_game() first."
     if not keys:
         return engine.read_screen()
     try:
-        engine.send_keys(keys)
+        engine.send_keys(_normalize_keys(keys))
         screen = engine.wait_for_stable(timeout=2.0)
         return screen
     except Exception as exc:
@@ -78,20 +140,31 @@ async def send_keys(keys: str = "") -> str:
 @mcp.tool(
     description=(
         "Start a fresh DCSS game. Any current game is terminated first.\n\n"
-        "After calling this, the main menu appears. For a quick start, "
-        "send_keys('P') to play the default character, or send_keys('C') to customise."
+        "By default auto_play=true, which also chooses Play on the main menu "
+        "so the game is ready for read_screen() and send_keys(). Set "
+        "auto_play=false if you specifically want to stop at the menu."
     )
 )
-async def start_new_game() -> str:
+async def start_game(auto_play: bool = True) -> str:
+    """Start a fresh game, defaulting to the quickest playable character."""
     try:
-        engine.stop()
-        engine.clean_save_files()
-        engine.start()
-        screen = engine.wait_for_stable(timeout=6.0)
+        screen = await _start_game_impl(auto_play=auto_play)
         return screen
     except Exception as exc:
         logger.exception("start_game failed")
         return f"ERROR starting game: {exc}"
+
+
+@mcp.tool(
+    description=(
+        "Compatibility alias for start_game(). Starts a fresh DCSS game. "
+        "By default, it also chooses Play on the main menu so the run is "
+        "ready for read_screen() and send_keys(). Set auto_play=false if you "
+        "specifically want to stop at the menu."
+    )
+)
+async def start_new_game(auto_play: bool = True) -> str:
+    return await start_game(auto_play=auto_play)
 
 
 @mcp.tool(
@@ -274,27 +347,47 @@ if __name__ == "__main__":
 
     import uvicorn
     from mcp.server.transport_security import TransportSecuritySettings
-
-    # Build SSE app manually to disable DNS rebinding protection (breaks on Render)
-    from mcp.server.sse import SseServerTransport
     from starlette.applications import Starlette
-    from starlette.routing import Route, Mount
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
 
     security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    sse = SseServerTransport("/messages/", security_settings=security)
+    mcp.settings.transport_security = security
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = port
+    mcp.settings.streamable_http_path = "/mcp"
+    mcp.settings.sse_path = "/sse"
+    mcp.settings.message_path = "/messages/"
 
-    async def handle_sse(request):
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as streams:
-            await mcp._mcp_server.run(
-                streams[0], streams[1],
-                mcp._mcp_server.create_initialization_options(),
-            )
+    async def health(_request):
+        return JSONResponse({
+            "ok": True,
+            "name": "DCSS Game Server",
+            "mcp": "/mcp",
+            "sse": "/sse",
+            "tools": [
+                "start_game",
+                "read_screen",
+                "send_keys",
+                "start_new_game",
+                "save_game",
+                "load_game",
+                "list_saves",
+                "delete_save",
+                "game_status",
+            ],
+        })
 
-    app = Starlette(routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages/", app=sse.handle_post_message),
-    ])
+    streamable_app = mcp.streamable_http_app()
+    sse_app = mcp.sse_app()
+    app = Starlette(
+        routes=[
+            Route("/", endpoint=health, methods=["GET"]),
+            Route("/health", endpoint=health, methods=["GET"]),
+            *streamable_app.routes,
+            *sse_app.routes,
+        ],
+        lifespan=lambda app: mcp.session_manager.run(),
+    )
 
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
