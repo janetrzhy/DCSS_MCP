@@ -57,6 +57,9 @@ class DcssEngine:
             command,
         )
         self.wait_for_stable(timeout=8.0, require_nonblank=True)
+        screen = self.read_screen()
+        if "DCSS_PROCESS_EXITED" in screen:
+            raise RuntimeError(f"DCSS exited during startup.\n{screen}")
         if not self.is_running:
             raise RuntimeError(f"DCSS tmux session exited immediately. command={command!r}")
 
@@ -175,15 +178,16 @@ class DcssEngine:
         }
 
     def _crawl_shell_command(self, extra_args: tuple[str, ...]) -> str:
+        crawl = (
+            f"env HOME={_sh(HOME_DIR)} TERM={_sh(DCSS_TERM)} "
+            f"LINES={ROWS} COLUMNS={COLS} DCSS_SAVE_DIR={_sh(SAVE_DIR)} "
+            f"{_sh(DCSS_BINARY)} -dir {_sh(CRAWL_DIR)}"
+        )
+        crawl += "".join(f" {_sh(arg)}" for arg in extra_args)
         parts = [
             f"cd {_sh(HOME_DIR)}",
-            (
-                f"env HOME={_sh(HOME_DIR)} TERM={_sh(DCSS_TERM)} "
-                f"LINES={ROWS} COLUMNS={COLS} DCSS_SAVE_DIR={_sh(SAVE_DIR)} "
-                f"{_sh(DCSS_BINARY)} -dir {_sh(CRAWL_DIR)}"
-            ),
+            f"{crawl}; code=$?; printf '\\nDCSS_PROCESS_EXITED code=%s\\n' \"$code\"; sleep 300",
         ]
-        parts[-1] += "".join(f" {_sh(arg)}" for arg in extra_args)
         return " && ".join(parts)
 
     def _validate_runtime(self) -> None:
