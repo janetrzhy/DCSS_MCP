@@ -182,6 +182,18 @@ class DcssEngine:
         binary = Path(DCSS_BINARY)
         screen = self._display_text()
         proc: dict[str, str] = {}
+        terminfo = "unknown"
+        try:
+            info = subprocess.run(
+                ["infocmp", DCSS_TERM],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            terminfo = "ok" if info.returncode == 0 else f"missing: {info.stderr.strip() or info.stdout.strip()}"
+        except Exception as exc:
+            terminfo = f"unavailable: {exc}"
         if self.child_pid is not None:
             proc_dir = Path(f"/proc/{self.child_pid}")
             for name in ("status", "cmdline", "wchan"):
@@ -208,6 +220,7 @@ class DcssEngine:
             "binary_exists": binary.exists(),
             "binary_executable": os.access(binary, os.X_OK),
             "term": DCSS_TERM,
+            "terminfo": terminfo[:300],
             "use_script": DCSS_USE_SCRIPT,
             "script_binary": SCRIPT_BINARY,
             "script_exists": Path(SCRIPT_BINARY).exists(),

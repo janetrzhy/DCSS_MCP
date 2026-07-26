@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     fuse \
     libncursesw6 \
+    ncurses-term \
     liblua5.1-0 \
     libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/*
