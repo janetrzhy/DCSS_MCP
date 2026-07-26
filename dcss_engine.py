@@ -99,7 +99,7 @@ class DcssEngine:
             self._set_pty_size(fd, ROWS, COLS)
             self.is_running = True
             # wait for first screen draw
-            self.wait_for_stable()
+            self.wait_for_stable(timeout=3.0, require_nonblank=True)
             if self._poll_child_exit():
                 screen = self._display_text().strip()
                 detail = (
@@ -152,6 +152,24 @@ class DcssEngine:
         """Return lightweight runtime diagnostics for MCP status/debug output."""
         binary = Path(DCSS_BINARY)
         screen = self._display_text()
+        proc: dict[str, str] = {}
+        if self.child_pid is not None:
+            proc_dir = Path(f"/proc/{self.child_pid}")
+            for name in ("status", "cmdline", "wchan"):
+                path = proc_dir / name
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    if name == "cmdline":
+                        text = text.replace("\x00", " ").strip()
+                    proc[name] = text[:1200]
+                except OSError as exc:
+                    proc[name] = f"<unavailable: {exc}>"
+            for name in ("cwd", "exe"):
+                path = proc_dir / name
+                try:
+                    proc[name] = os.readlink(path)
+                except OSError as exc:
+                    proc[name] = f"<unavailable: {exc}>"
         return {
             "is_running": self.is_running,
             "child_pid": self.child_pid,
@@ -169,9 +187,10 @@ class DcssEngine:
             "screen_nonblank_chars": len(screen.strip()),
             "raw_tail_chars": len(self._raw_tail),
             "raw_tail_preview": self._raw_tail[-600:],
+            "proc": proc,
         }
 
-    def wait_for_stable(self, timeout: float = 6.0) -> str:
+    def wait_for_stable(self, timeout: float = 6.0, require_nonblank: bool = False) -> str:
         """Wait until screen output stabilises (no changes for SCREEN_STABLE_SEC)."""
         last = ""
         stable_for = 0.0
@@ -180,6 +199,11 @@ class DcssEngine:
         while time.monotonic() < deadline:
             self._drain_output()
             current = self._display_text()
+            if require_nonblank and not current.strip():
+                last = current
+                stable_for = 0.0
+                time.sleep(0.08)
+                continue
             if current == last:
                 stable_for += 0.08
                 if stable_for >= SCREEN_STABLE_SEC:

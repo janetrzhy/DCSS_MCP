@@ -109,9 +109,9 @@ async def _start_game_impl(
         extra_args = ["-name", name, "-species", species, "-background", background]
 
     engine.start(*extra_args)
-    screen = engine.wait_for_stable(timeout=6.0)
+    screen = engine.wait_for_stable(timeout=10.0, require_nonblank=True)
 
-    if auto_play:
+    if auto_play and screen.strip():
         engine.send_keys("\r")
         screen = engine.wait_for_stable(timeout=8.0)
         if weapon and "choice of weapons" in screen.lower():
@@ -135,6 +135,12 @@ def _screen_or_blank_diagnostic(screen: str) -> str:
     if diag["raw_tail_preview"]:
         lines.append("raw_tail_preview:")
         lines.append(diag["raw_tail_preview"])
+    if diag["proc"]:
+        lines.append("proc:")
+        for key in ("cmdline", "status", "wchan", "cwd", "exe"):
+            value = diag["proc"].get(key)
+            if value:
+                lines.append(f"{key}: {value}")
     return "\n".join(lines)
 
 
@@ -369,6 +375,12 @@ async def server_info() -> str:
     if diag["raw_tail_preview"]:
         lines.append("Raw tail preview:")
         lines.append(diag["raw_tail_preview"])
+    if diag["proc"]:
+        lines.append("Process diagnostics:")
+        for key in ("cmdline", "status", "wchan", "cwd", "exe"):
+            value = diag["proc"].get(key)
+            if value:
+                lines.append(f"{key}: {value}")
     return "\n".join(lines)
 
 

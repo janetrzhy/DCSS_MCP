@@ -24,7 +24,7 @@ RUN curl -sL -o /tmp/dcss.AppImage \
     && /usr/local/bin/crawl -version \
     && rm -f /tmp/dcss.AppImage
 
-ENV DCSS_BINARY=/usr/local/bin/crawl
+ENV DCSS_BINARY=/opt/dcss/usr/bin/crawl
 ENV DCSS_TERM=vt100
 
 WORKDIR /app
