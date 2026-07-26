@@ -46,7 +46,7 @@ claude.ai / ChatGPT          Render Cloud
 https://你的render域名.onrender.com/mcp
 ```
 
-连接成功后，让 ChatGPT 调用 `start_game()`，它会直接启动一个默认开局；之后用
+连接成功后，让 ChatGPT 调用 `start_game()`，它会直接启动一个默认 MiBe 开局；之后用
 `read_screen()` / `send_keys()` 读取屏幕和操作游戏。
 
 ### Claude / 旧 SSE 连接配置
@@ -73,7 +73,7 @@ https://你的render域名.onrender.com/sse
 
 | Tool | 描述 |
 |------|------|
-| `start_game(auto_play=true)` | 开始新游戏，默认自动选 Play 进入默认开局 |
+| `start_game(auto_play=true)` | 开始新游戏；可传 `name`/`species`/`background`/`weapon` 自建角色，默认 MiBe + hand axe |
 | `read_screen()` | 读取当前 DCSS 屏幕内容（80×24 纯文本） |
 | `send_keys(keys)` | 发送按键，返回更新后的屏幕；支持 `Tab`、`Space`、`Enter` 这类可读按键名 |
 | `start_new_game(auto_play=true)` | `start_game` 的兼容别名 |
@@ -95,6 +95,14 @@ AI 的典型游戏循环：
 5. 当危险时 save_game("before_lair") → 存档保平安
 6. 死了就 load_game("before_lair")   → 读档重来
 ```
+
+自定义角色示例：
+
+```
+start_game(name="Yan", species="Gr", background="EE", weapon="")
+```
+
+`weapon=""` 会停在武器选择；`auto_play=false` 会停在初始菜单，完全手动选择。
 
 ### 推荐种族/职业
 

@@ -45,6 +45,7 @@ except (ImportError, ModuleNotFoundError) as exc:
 DCSS_BINARY = os.environ.get("DCSS_BINARY", "/usr/local/bin/crawl")
 SAVE_DIR = Path(os.environ.get("DCSS_SAVE_DIR", "/tmp/dcss-saves"))
 HOME_DIR = Path("/tmp/dcss-home")
+DCSS_TERM = os.environ.get("DCSS_TERM", "vt100")
 
 # ── PTY size ──────────────────────────────────────────────────────────
 COLS, ROWS = 80, 24
@@ -225,8 +226,11 @@ class DcssEngine:
         """Set up the child process environment and exec crawl."""
         os.chdir(str(HOME_DIR))
         os.environ["HOME"] = str(HOME_DIR)
-        os.environ["TERM"] = "xterm-256color"
+        os.environ["TERM"] = DCSS_TERM
+        os.environ["LINES"] = str(ROWS)
+        os.environ["COLUMNS"] = str(COLS)
         os.environ["DCSS_SAVE_DIR"] = str(SAVE_DIR)
+        self._set_pty_size(1, ROWS, COLS)
 
         args = [DCSS_BINARY]
         args.extend(extra_args)

@@ -86,16 +86,29 @@ def _normalize_keys(keys: str) -> str:
     return "".join(out)
 
 
-async def _start_game_impl(auto_play: bool = True) -> str:
-    """Start crawl and optionally choose the default Play menu item."""
+async def _start_game_impl(
+    auto_play: bool = True,
+    name: str = "MCP",
+    species: str = "Mi",
+    background: str = "Be",
+    weapon: str = "c",
+) -> str:
+    """Start crawl and optionally enter the preselected default game."""
     engine.stop()
     engine.clean_save_files()
-    engine.start()
+    extra_args: list[str] = []
+    if auto_play:
+        extra_args = ["-name", name, "-species", species, "-background", background]
+
+    engine.start(*extra_args)
     screen = engine.wait_for_stable(timeout=6.0)
 
     if auto_play:
-        engine.send_keys("P")
+        engine.send_keys("\r")
         screen = engine.wait_for_stable(timeout=8.0)
+        if weapon and "choice of weapons" in screen.lower():
+            engine.send_keys(weapon[:1])
+            screen = engine.wait_for_stable(timeout=8.0)
 
     return screen
 
@@ -140,15 +153,30 @@ async def send_keys(keys: str = "") -> str:
 @mcp.tool(
     description=(
         "Start a fresh DCSS game. Any current game is terminated first.\n\n"
-        "By default auto_play=true, which also chooses Play on the main menu "
-        "so the game is ready for read_screen() and send_keys(). Set "
-        "auto_play=false if you specifically want to stop at the menu."
+        "By default auto_play=true, which preselects a simple Minotaur "
+        "Berserker using name/species/background and presses Enter on the "
+        "initial Dungeon Crawl menu. Pass custom name/species/background to "
+        "preselect a different character. If DCSS asks for a starting weapon, "
+        "the weapon argument sends that one-letter choice; pass weapon='' to "
+        "stop at weapon selection. Set auto_play=false to stop at the menu."
     )
 )
-async def start_game(auto_play: bool = True) -> str:
+async def start_game(
+    auto_play: bool = True,
+    name: str = "MCP",
+    species: str = "Mi",
+    background: str = "Be",
+    weapon: str = "c",
+) -> str:
     """Start a fresh game, defaulting to the quickest playable character."""
     try:
-        screen = await _start_game_impl(auto_play=auto_play)
+        screen = await _start_game_impl(
+            auto_play=auto_play,
+            name=name,
+            species=species,
+            background=background,
+            weapon=weapon,
+        )
         return screen
     except Exception as exc:
         logger.exception("start_game failed")
@@ -158,13 +186,25 @@ async def start_game(auto_play: bool = True) -> str:
 @mcp.tool(
     description=(
         "Compatibility alias for start_game(). Starts a fresh DCSS game. "
-        "By default, it also chooses Play on the main menu so the run is "
-        "ready for read_screen() and send_keys(). Set auto_play=false if you "
-        "specifically want to stop at the menu."
+        "By default, it preselects a simple Minotaur Berserker, but you can "
+        "pass custom name/species/background/weapon. Use weapon='' to stop at "
+        "weapon selection, or auto_play=false to stop at the menu."
     )
 )
-async def start_new_game(auto_play: bool = True) -> str:
-    return await start_game(auto_play=auto_play)
+async def start_new_game(
+    auto_play: bool = True,
+    name: str = "MCP",
+    species: str = "Mi",
+    background: str = "Be",
+    weapon: str = "c",
+) -> str:
+    return await start_game(
+        auto_play=auto_play,
+        name=name,
+        species=species,
+        background=background,
+        weapon=weapon,
+    )
 
 
 @mcp.tool(
