@@ -134,6 +134,8 @@ DATABASE_URL="postgresql://..." python server.py
 
 ## 已知限制（Render Free Tier）
 
+> Render 镜像当前使用 Debian/Ubuntu 的 console `crawl` 包，优先保证 PTY/curses 稳定可玩；版本可能早于上游 AppImage。
+
 | 限制 | 影响 | 对策 |
 |------|------|------|
 | 512MB RAM | ✅ 够用 | — |

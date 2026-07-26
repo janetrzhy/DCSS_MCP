@@ -1,249 +1,96 @@
-"""DCSS process manager — runs the game in a pseudo-terminal.
+"""DCSS process manager backed by tmux.
 
-Architecture:
-  ┌──────────────┐
-  │  DCSS MCP    │  sends keys / reads screen via this module
-  │  Server      │
-  └──────┬───────┘
-         │ os.read / os.write
-  ┌──────┴───────┐
-  │   pty (pyte) │  VT100 terminal emulator → clean 80×24 text
-  ├──────────────┤
-  │   crawl      │  Dungeon Crawl Stone Soup process
-  └──────────────┘
-
-Save/restore life cycle:
-   play → save_game() → send S → game exits → collect .cs files → upload PG
-   load → download PG → write .cs files → start crawl → auto-resume
+The MCP server does not need to own a curses pty.  DCSS runs inside a tmux
+session, while tools read with ``capture-pane`` and act with ``send-keys``.
+This mirrors the most reliable CLI-agent setup and works well on Render.
 """
 
+from __future__ import annotations
+
 import os
-import signal
+import shutil
 import subprocess
 import time
-import logging
-import shutil
-import shlex
 from pathlib import Path
 
-import pyte
-
-logger = logging.getLogger(__name__)
-
-try:
-    import pty
-    import select
-    import struct
-    import fcntl
-    import termios
-
-    POSIX_PTY_AVAILABLE = True
-    POSIX_PTY_ERROR: Exception | None = None
-except (ImportError, ModuleNotFoundError) as exc:
-    POSIX_PTY_AVAILABLE = False
-    POSIX_PTY_ERROR = exc
-
-DCSS_BINARY = os.environ.get("DCSS_BINARY", "/usr/local/bin/crawl")
+DCSS_BINARY = os.environ.get("DCSS_BINARY", "/usr/games/crawl")
+TMUX_BINARY = os.environ.get("TMUX_BINARY", "/usr/bin/tmux")
+TMUX_SESSION = os.environ.get("DCSS_TMUX_SESSION", "dcss")
 SAVE_DIR = Path(os.environ.get("DCSS_SAVE_DIR", "/tmp/dcss-saves"))
-HOME_DIR = Path("/tmp/dcss-home")
-DCSS_TERM = os.environ.get("DCSS_TERM", "vt100")
-DCSS_USE_SCRIPT = os.environ.get("DCSS_USE_SCRIPT", "0").lower() in {"1", "true", "yes"}
-SCRIPT_BINARY = os.environ.get("SCRIPT_BINARY", "/usr/bin/script")
+HOME_DIR = Path(os.environ.get("DCSS_HOME", "/tmp/dcss-home"))
+DCSS_TERM = os.environ.get("DCSS_TERM", "xterm-256color")
 
-# ── PTY size ──────────────────────────────────────────────────────────
 COLS, ROWS = 80, 24
-
-# ── timeouts (seconds) ────────────────────────────────────────────────
+SEND_WAIT_SEC = 0.18
 SCREEN_STABLE_SEC = 0.35
-SEND_WAIT_SEC = 0.15
 
 
 class DcssEngine:
-    """Manages one DCSS process running in a pty."""
+    """Manage one DCSS game running inside a tmux session."""
 
     def __init__(self):
-        self.master_fd: int | None = None
-        self.child_pid: int | None = None
-        self._process: subprocess.Popen | None = None
-        self.is_running: bool = False
-
-        # pyte terminal emulator
-        self._screen = pyte.Screen(COLS, ROWS)
-        self._stream = pyte.Stream(self._screen)
-        self._raw_tail = ""
-
-        # ensure directories
+        self.session_name = TMUX_SESSION
         HOME_DIR.mkdir(parents=True, exist_ok=True)
         SAVE_DIR.mkdir(parents=True, exist_ok=True)
         self._ensure_home_config()
 
-    # ── life cycle ──────────────────────────────────────────────────────
+    @property
+    def is_running(self) -> bool:
+        return self._tmux_ok("has-session", "-t", self.session_name)
 
     def start(self, *extra_args: str) -> None:
-        """Spawn crawl in a pty."""
-        if not POSIX_PTY_AVAILABLE:
-            raise RuntimeError(
-                "DCSS engine requires a Linux/POSIX pty. "
-                f"Run it in Docker or on Linux. Import error: {POSIX_PTY_ERROR}"
-            )
-        self._validate_binary()
+        """Start crawl in a fresh tmux session."""
+        self._validate_runtime()
+        self.stop()
 
-        if self.is_running:
-            self.stop()
-
-        self._screen.reset()
-        master_fd, slave_fd = pty.openpty()
-        self._set_pty_size(slave_fd, ROWS, COLS)
-
-        env = os.environ.copy()
-        env["HOME"] = str(HOME_DIR)
-        env["TERM"] = DCSS_TERM
-        env["LINES"] = str(ROWS)
-        env["COLUMNS"] = str(COLS)
-        env["DCSS_SAVE_DIR"] = str(SAVE_DIR)
-
-        exec_path, exec_args = self._build_exec_args(extra_args)
-
-        def _setup_child_tty() -> None:
-            os.setsid()
-            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-            self._set_pty_size(0, ROWS, COLS)
-
-        try:
-            self._process = subprocess.Popen(
-                exec_args,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                cwd=str(HOME_DIR),
-                env=env,
-                close_fds=True,
-                preexec_fn=_setup_child_tty,
-            )
-        finally:
-            os.close(slave_fd)
-
-        self.child_pid = self._process.pid
-        self.master_fd = master_fd
-        self._set_pty_size(master_fd, ROWS, COLS)
-        self.is_running = True
-        self.wait_for_stable(timeout=3.0, require_nonblank=True)
-        if self._poll_child_exit():
-            screen = self._display_text().strip()
-            detail = (
-                f"DCSS exited immediately. exec_path={exec_path!r}, "
-                f"args={exec_args!r}, DCSS_BINARY={DCSS_BINARY!r}, "
-                f"realpath={os.path.realpath(DCSS_BINARY)!r}."
-            )
-            if screen:
-                detail += f"\nLast terminal output:\n{screen}"
-            raise RuntimeError(detail)
-        logger.info("DCSS started (pid=%d).", self.child_pid)
+        command = self._crawl_shell_command(extra_args)
+        self._run_tmux(
+            "new-session",
+            "-d",
+            "-s",
+            self.session_name,
+            "-x",
+            str(COLS),
+            "-y",
+            str(ROWS),
+            command,
+        )
+        self.wait_for_stable(timeout=8.0, require_nonblank=True)
+        if not self.is_running:
+            raise RuntimeError(f"DCSS tmux session exited immediately. command={command!r}")
 
     def stop(self) -> None:
-        """Kill the DCSS process."""
-        if not self.is_running or self.child_pid is None:
-            self._reset_state()
-            return
-        try:
-            os.kill(self.child_pid, signal.SIGTERM)
-            # give it 5 s to exit gracefully
-            for _ in range(50):
-                wpid, status = os.waitpid(self.child_pid, os.WNOHANG)
-                if wpid == self.child_pid:
-                    break
-                time.sleep(0.1)
-            else:
-                os.kill(self.child_pid, signal.SIGKILL)
-                os.waitpid(self.child_pid, 0)
-        except (ProcessLookupError, ChildProcessError):
-            pass
-        self._reset_state()
-        logger.info("DCSS stopped.")
-
-    # ── I/O ─────────────────────────────────────────────────────────────
+        if self.is_running:
+            self._run_tmux("kill-session", "-t", self.session_name, check=False)
 
     def send_keys(self, keys: str) -> None:
-        """Write keystrokes into the pty."""
-        if not self.is_running or self.master_fd is None:
+        if not self.is_running:
             raise RuntimeError("DCSS is not running.")
-        raw = keys.encode("utf-8")
-        os.write(self.master_fd, raw)
+        for key in _split_tmux_keys(keys):
+            self._run_tmux("send-keys", "-t", self.session_name, key)
         time.sleep(SEND_WAIT_SEC)
-        self._drain_output()
 
     def read_screen(self) -> str:
-        """Return the current emulated terminal screen as plain text."""
-        self._drain_output()
-        return self._display_text()
-
-    def diagnostics(self) -> dict:
-        """Return lightweight runtime diagnostics for MCP status/debug output."""
-        binary = Path(DCSS_BINARY)
-        screen = self._display_text()
-        proc: dict[str, str] = {}
-        terminfo = "unknown"
-        try:
-            info = subprocess.run(
-                ["infocmp", DCSS_TERM],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            terminfo = "ok" if info.returncode == 0 else f"missing: {info.stderr.strip() or info.stdout.strip()}"
-        except Exception as exc:
-            terminfo = f"unavailable: {exc}"
-        if self.child_pid is not None:
-            proc_dir = Path(f"/proc/{self.child_pid}")
-            for name in ("status", "cmdline", "wchan"):
-                path = proc_dir / name
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                    if name == "cmdline":
-                        text = text.replace("\x00", " ").strip()
-                    proc[name] = text[:1200]
-                except OSError as exc:
-                    proc[name] = f"<unavailable: {exc}>"
-            for name in ("cwd", "exe"):
-                path = proc_dir / name
-                try:
-                    proc[name] = os.readlink(path)
-                except OSError as exc:
-                    proc[name] = f"<unavailable: {exc}>"
-        return {
-            "is_running": self.is_running,
-            "child_pid": self.child_pid,
-            "master_fd": self.master_fd,
-            "binary": DCSS_BINARY,
-            "binary_realpath": os.path.realpath(DCSS_BINARY),
-            "binary_exists": binary.exists(),
-            "binary_executable": os.access(binary, os.X_OK),
-            "term": DCSS_TERM,
-            "terminfo": terminfo[:300],
-            "use_script": DCSS_USE_SCRIPT,
-            "script_binary": SCRIPT_BINARY,
-            "script_exists": Path(SCRIPT_BINARY).exists(),
-            "rows": ROWS,
-            "cols": COLS,
-            "home": str(HOME_DIR),
-            "save_dir": str(self._resolve_save_dir()),
-            "screen_chars": len(screen),
-            "screen_nonblank_chars": len(screen.strip()),
-            "raw_tail_chars": len(self._raw_tail),
-            "raw_tail_preview": self._raw_tail[-600:],
-            "proc": proc,
-        }
+        if not self.is_running:
+            return ""
+        result = self._run_tmux(
+            "capture-pane",
+            "-t",
+            self.session_name,
+            "-p",
+            "-S",
+            f"-{ROWS - 1}",
+            check=True,
+        )
+        return _normalise_screen(result.stdout)
 
     def wait_for_stable(self, timeout: float = 6.0, require_nonblank: bool = False) -> str:
-        """Wait until screen output stabilises (no changes for SCREEN_STABLE_SEC)."""
         last = ""
         stable_for = 0.0
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
-            self._drain_output()
-            current = self._display_text()
+            current = self.read_screen()
             if require_nonblank and not current.strip():
                 last = current
                 stable_for = 0.0
@@ -257,37 +104,33 @@ class DcssEngine:
                 last = current
                 stable_for = 0.0
             time.sleep(0.08)
-
-        logger.warning("Screen did not stabilise within %.1f s.", timeout)
         return last
 
-    # ── save / restore ──────────────────────────────────────────────────
+    def wait_for_exit(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.is_running:
+                return True
+            time.sleep(0.1)
+        return False
 
     def collect_save_files(self) -> dict[str, bytes]:
-        """Read all files from the save directory.  Returns {name: bytes}."""
         files: dict[str, bytes] = {}
         save_path = self._resolve_save_dir()
         if not save_path.exists():
             return files
         for p in sorted(save_path.iterdir()):
             if p.is_file():
-                try:
-                    files[p.name] = p.read_bytes()
-                    logger.debug("Collected save file: %s (%d B)", p.name, p.stat().st_size)
-                except OSError as exc:
-                    logger.warning("Cannot read save file %s: %s", p.name, exc)
+                files[p.name] = p.read_bytes()
         return files
 
     def restore_save_files(self, files: dict[str, bytes]) -> None:
-        """Write save files to the correct directory before starting DCSS."""
         save_path = self._resolve_save_dir()
         save_path.mkdir(parents=True, exist_ok=True)
         for name, data in files.items():
             (save_path / name).write_bytes(data)
-            logger.debug("Restored save file: %s (%d B)", name, len(data))
 
     def clean_save_files(self) -> None:
-        """Remove all save files (for a brand-new game)."""
         save_path = self._resolve_save_dir()
         if save_path.exists():
             for p in save_path.iterdir():
@@ -296,113 +139,144 @@ class DcssEngine:
                 else:
                     p.unlink(missing_ok=True)
 
-    def wait_for_exit(self, timeout: float = 5.0) -> bool:
-        """Wait for the DCSS process to exit.  Returns True if it exited."""
-        if self.child_pid is None:
-            return True
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                wpid, status = os.waitpid(self.child_pid, os.WNOHANG)
-                if wpid == self.child_pid:
-                    self._reset_state()
-                    return True
-            except ChildProcessError:
-                self._reset_state()
-                return True
-            time.sleep(0.1)
-        return False
+    def diagnostics(self) -> dict:
+        crawl = Path(DCSS_BINARY)
+        tmux = Path(TMUX_BINARY)
+        screen = self.read_screen()
+        return {
+            "backend": "tmux",
+            "is_running": self.is_running,
+            "session": self.session_name,
+            "child_pid": None,
+            "master_fd": None,
+            "binary": DCSS_BINARY,
+            "binary_realpath": os.path.realpath(DCSS_BINARY),
+            "binary_exists": crawl.exists(),
+            "binary_executable": os.access(crawl, os.X_OK),
+            "tmux_binary": TMUX_BINARY,
+            "tmux_exists": tmux.exists(),
+            "term": DCSS_TERM,
+            "terminfo": self._terminfo_status(),
+            "use_script": False,
+            "script_binary": "",
+            "script_exists": False,
+            "rows": ROWS,
+            "cols": COLS,
+            "home": str(HOME_DIR),
+            "save_dir": str(self._resolve_save_dir()),
+            "screen_chars": len(screen),
+            "screen_nonblank_chars": len(screen.strip()),
+            "raw_tail_chars": 0,
+            "raw_tail_preview": "",
+            "proc": self._tmux_process_info(),
+        }
 
-    # ── internals ───────────────────────────────────────────────────────
+    def _crawl_shell_command(self, extra_args: tuple[str, ...]) -> str:
+        parts = [
+            f"cd {_sh(HOME_DIR)}",
+            (
+                f"env HOME={_sh(HOME_DIR)} TERM={_sh(DCSS_TERM)} "
+                f"LINES={ROWS} COLUMNS={COLS} DCSS_SAVE_DIR={_sh(SAVE_DIR)} "
+                f"{_sh(DCSS_BINARY)}"
+            ),
+        ]
+        parts[-1] += "".join(f" {_sh(arg)}" for arg in extra_args)
+        return " && ".join(parts)
 
-    def _build_exec_args(self, extra_args: tuple[str, ...]) -> tuple[str, list[str]]:
-        args = [DCSS_BINARY]
-        args.extend(extra_args)
-        exec_path = DCSS_BINARY
-        exec_args = args
-        if DCSS_USE_SCRIPT and Path(SCRIPT_BINARY).exists():
-            command = " ".join(shlex.quote(arg) for arg in args)
-            exec_path = SCRIPT_BINARY
-            exec_args = [SCRIPT_BINARY, "-q", "-f", "-e", "-c", command, "/dev/null"]
-        return exec_path, exec_args
-
-    def _resolve_save_dir(self) -> Path:
-        """DCSS saves inside ~/.crawl/saves/ by default."""
-        return HOME_DIR / ".crawl" / "saves"
-
-    def _validate_binary(self) -> None:
-        binary = Path(DCSS_BINARY)
-        if not binary.exists():
-            raise FileNotFoundError(
-                f"DCSS binary does not exist: {DCSS_BINARY!r} "
-                f"(realpath={os.path.realpath(DCSS_BINARY)!r})."
-            )
-        if not os.access(binary, os.X_OK):
-            raise PermissionError(f"DCSS binary is not executable: {DCSS_BINARY!r}.")
+    def _validate_runtime(self) -> None:
+        if not Path(TMUX_BINARY).exists():
+            raise FileNotFoundError(f"tmux binary does not exist: {TMUX_BINARY!r}")
+        if not Path(DCSS_BINARY).exists():
+            raise FileNotFoundError(f"DCSS binary does not exist: {DCSS_BINARY!r}")
+        if not os.access(DCSS_BINARY, os.X_OK):
+            raise PermissionError(f"DCSS binary is not executable: {DCSS_BINARY!r}")
 
     def _ensure_home_config(self) -> None:
-        """Write a minimal crawl init for stable ASCII terminal output."""
         crawl_dir = HOME_DIR / ".crawl"
         crawl_dir.mkdir(parents=True, exist_ok=True)
         init_file = crawl_dir / "init.txt"
         if not init_file.exists():
-            init_file.write_text(
-                "\n".join([
-                    "tile_display_mode = ascii",
-                    "",
-                ]),
-                encoding="utf-8",
-            )
+            init_file.write_text("tile_display_mode = ascii\n", encoding="utf-8")
 
-    def _poll_child_exit(self) -> bool:
-        """Return True and reset state if the crawl child has exited."""
-        if self.child_pid is None:
-            return False
+    def _resolve_save_dir(self) -> Path:
+        return HOME_DIR / ".crawl" / "saves"
+
+    def _run_tmux(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [TMUX_BINARY, *args],
+            check=check,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def _tmux_ok(self, *args: str) -> bool:
         try:
-            wpid, _status = os.waitpid(self.child_pid, os.WNOHANG)
-            if wpid == self.child_pid:
-                self._reset_state()
-                return True
-        except ChildProcessError:
-            self._reset_state()
-            return True
-        return False
+            result = self._run_tmux(*args, check=False)
+            return result.returncode == 0
+        except Exception:
+            return False
 
-    def _drain_output(self) -> None:
-        """Read all pending bytes from the pty and feed them to pyte."""
-        if self.master_fd is None:
-            return
-        while True:
-            r, _, _ = select.select([self.master_fd], [], [], 0)
-            if not r:
-                break
-            try:
-                data = os.read(self.master_fd, 8192)
-                if not data:
-                    break
-                decoded = data.decode("utf-8", errors="replace")
-                self._raw_tail = (self._raw_tail + decoded)[-4000:]
-                self._stream.feed(decoded)
-            except (OSError, ValueError):
-                break
+    def _tmux_process_info(self) -> dict[str, str]:
+        if not self.is_running:
+            return {}
+        try:
+            result = self._run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.session_name,
+                "pid=#{pane_pid} command=#{pane_current_command} tty=#{pane_tty} cwd=#{pane_current_path}",
+            )
+            return {"tmux_pane": result.stdout.strip()}
+        except Exception as exc:
+            return {"tmux_pane": f"<unavailable: {exc}>"}
 
-    def _display_text(self) -> str:
-        """Render the emulated screen as newline-separated text."""
-        lines = self._screen.display
-        return "\n".join(line.rstrip() for line in lines)
+    def _terminfo_status(self) -> str:
+        try:
+            info = subprocess.run(
+                ["infocmp", DCSS_TERM],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            return "ok" if info.returncode == 0 else f"missing: {info.stderr.strip() or info.stdout.strip()}"
+        except Exception as exc:
+            return f"unavailable: {exc}"
 
-    def _set_pty_size(self, fd: int, rows: int, cols: int) -> None:
-        """Resize the pty window."""
-        size = struct.pack("HHHH", rows, cols, 0, 0)
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
 
-    def _reset_state(self) -> None:
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
-        self.is_running = False
-        self.master_fd = None
-        self.child_pid = None
-        self._process = None
+def _sh(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def _normalise_screen(text: str) -> str:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(line.rstrip() for line in lines[-ROWS:])
+
+
+def _split_tmux_keys(keys: str) -> list[str]:
+    if not keys:
+        return []
+    if keys == "\r":
+        return ["Enter"]
+
+    out: list[str] = []
+    i = 0
+    special = {
+        "\r": "Enter",
+        "\n": "Enter",
+        "\t": "Tab",
+        "\x1b": "Escape",
+        " ": "Space",
+    }
+    while i < len(keys):
+        ch = keys[i]
+        if ch in special:
+            out.append(special[ch])
+        else:
+            out.append(ch)
+        i += 1
+    return out

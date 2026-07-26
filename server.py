@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server")
 
-SERVER_VERSION = "2026-07-26-pty-debug-v1"
+SERVER_VERSION = "2026-07-26-tmux-crawl-v1"
 DEPLOY_COMMIT = (
     os.environ.get("RENDER_GIT_COMMIT")
     or os.environ.get("RENDER_COMMIT")
@@ -138,7 +138,7 @@ def _screen_or_blank_diagnostic(screen: str) -> str:
         lines.append(diag["raw_tail_preview"])
     if diag["proc"]:
         lines.append("proc:")
-        for key in ("cmdline", "status", "wchan", "cwd", "exe"):
+        for key in ("tmux_pane", "cmdline", "status", "wchan", "cwd", "exe"):
             value = diag["proc"].get(key)
             if value:
                 lines.append(f"{key}: {value}")
@@ -366,9 +366,11 @@ async def server_info() -> str:
         f"Deploy commit: {DEPLOY_COMMIT}",
         f"Render service: {os.environ.get('RENDER_SERVICE_NAME', '?')}",
         f"Render instance: {os.environ.get('RENDER_INSTANCE_ID', '?')}",
+        f"Backend: {diag.get('backend', '?')}",
         f"DCSS binary: {diag['binary']}",
         f"DCSS binary realpath: {diag['binary_realpath']}",
         f"DCSS binary exists/executable: {diag['binary_exists']}/{diag['binary_executable']}",
+        f"tmux: {diag.get('tmux_binary', '?')} exists={diag.get('tmux_exists', '?')} session={diag.get('session', '?')}",
         f"TERM: {diag['term']}  size: {diag['cols']}x{diag['rows']} terminfo={diag['terminfo']}",
         f"script launcher: {diag['use_script']} {diag['script_binary']} exists={diag['script_exists']}",
         f"Running: {diag['is_running']}  pid: {diag['child_pid']}  fd: {diag['master_fd']}",
@@ -379,7 +381,7 @@ async def server_info() -> str:
         lines.append(diag["raw_tail_preview"])
     if diag["proc"]:
         lines.append("Process diagnostics:")
-        for key in ("cmdline", "status", "wchan", "cwd", "exe"):
+        for key in ("tmux_pane", "cmdline", "status", "wchan", "cwd", "exe"):
             value = diag["proc"].get(key)
             if value:
                 lines.append(f"{key}: {value}")
