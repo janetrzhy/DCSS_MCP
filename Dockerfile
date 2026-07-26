@@ -22,8 +22,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code
 COPY . .
 
+RUN useradd -m -d /home/dcss dcss \
+    && chown -R dcss:dcss /app
+
+USER dcss
+
 # DCSS init file — force ASCII mode for clean AI-readable output
-RUN mkdir -p /root/.crawl && echo "tile_display_mode = ascii" > /root/.crawl/init.txt
+RUN mkdir -p /home/dcss/.crawl && echo "tile_display_mode = ascii" > /home/dcss/.crawl/init.txt
 
 EXPOSE 8000
 
