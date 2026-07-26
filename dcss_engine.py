@@ -175,6 +175,7 @@ class DcssEngine:
             "raw_tail_chars": 0,
             "raw_tail_preview": "",
             "proc": self._tmux_process_info(),
+            "process_table": self._process_table(),
         }
 
     def _crawl_shell_command(self, extra_args: tuple[str, ...]) -> str:
@@ -240,6 +241,24 @@ class DcssEngine:
             return {"tmux_pane": result.stdout.strip()}
         except Exception as exc:
             return {"tmux_pane": f"<unavailable: {exc}>"}
+
+    def _process_table(self) -> str:
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "pid,ppid,pgid,sid,stat,comm,args"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            lines = [
+                line
+                for line in result.stdout.splitlines()
+                if any(token in line for token in ("tmux", "crawl", "sh", "python"))
+            ]
+            return "\n".join(lines[:40])
+        except Exception as exc:
+            return f"<unavailable: {exc}>"
 
     def _terminfo_status(self) -> str:
         try:

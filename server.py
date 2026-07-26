@@ -142,6 +142,9 @@ def _screen_or_blank_diagnostic(screen: str) -> str:
             value = diag["proc"].get(key)
             if value:
                 lines.append(f"{key}: {value}")
+    if diag.get("process_table"):
+        lines.append("process_table:")
+        lines.append(diag["process_table"])
     return "\n".join(lines)
 
 
@@ -386,6 +389,9 @@ async def server_info() -> str:
             value = diag["proc"].get(key)
             if value:
                 lines.append(f"{key}: {value}")
+    if diag.get("process_table"):
+        lines.append("Process table:")
+        lines.append(diag["process_table"])
     return "\n".join(lines)
 
 
