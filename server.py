@@ -129,6 +129,7 @@ def _screen_or_blank_diagnostic(screen: str) -> str:
         "SCREEN BLANK - DCSS process is running but pyte rendered no visible terminal cells.",
         f"server_version={SERVER_VERSION} commit={DEPLOY_COMMIT}",
         f"pid={diag['child_pid']} fd={diag['master_fd']} TERM={diag['term']} size={diag['cols']}x{diag['rows']}",
+        f"script_launcher={diag['use_script']} {diag['script_binary']} exists={diag['script_exists']}",
         f"binary={diag['binary']} realpath={diag['binary_realpath']}",
         f"raw_tail_chars={diag['raw_tail_chars']}",
     ]
@@ -369,6 +370,7 @@ async def server_info() -> str:
         f"DCSS binary realpath: {diag['binary_realpath']}",
         f"DCSS binary exists/executable: {diag['binary_exists']}/{diag['binary_executable']}",
         f"TERM: {diag['term']}  size: {diag['cols']}x{diag['rows']}",
+        f"script launcher: {diag['use_script']} {diag['script_binary']} exists={diag['script_exists']}",
         f"Running: {diag['is_running']}  pid: {diag['child_pid']}  fd: {diag['master_fd']}",
         f"Screen nonblank chars: {diag['screen_nonblank_chars']}  raw tail chars: {diag['raw_tail_chars']}",
     ]

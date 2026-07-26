@@ -19,11 +19,12 @@ Save/restore life cycle:
 
 import os
 import signal
+import subprocess
 import time
 import logging
 import shutil
+import shlex
 from pathlib import Path
-from typing import NoReturn
 
 import pyte
 
@@ -46,6 +47,8 @@ DCSS_BINARY = os.environ.get("DCSS_BINARY", "/usr/local/bin/crawl")
 SAVE_DIR = Path(os.environ.get("DCSS_SAVE_DIR", "/tmp/dcss-saves"))
 HOME_DIR = Path("/tmp/dcss-home")
 DCSS_TERM = os.environ.get("DCSS_TERM", "vt100")
+DCSS_USE_SCRIPT = os.environ.get("DCSS_USE_SCRIPT", "0").lower() in {"1", "true", "yes"}
+SCRIPT_BINARY = os.environ.get("SCRIPT_BINARY", "/usr/bin/script")
 
 # ── PTY size ──────────────────────────────────────────────────────────
 COLS, ROWS = 80, 24
@@ -61,6 +64,7 @@ class DcssEngine:
     def __init__(self):
         self.master_fd: int | None = None
         self.child_pid: int | None = None
+        self._process: subprocess.Popen | None = None
         self.is_running: bool = False
 
         # pyte terminal emulator
@@ -88,28 +92,53 @@ class DcssEngine:
             self.stop()
 
         self._screen.reset()
-        pid, fd = pty.fork()
+        master_fd, slave_fd = pty.openpty()
+        self._set_pty_size(slave_fd, ROWS, COLS)
 
-        if pid == 0:  # child
-            self._child_setup(extra_args)
-            # never returns
-        else:  # parent
-            self.child_pid = pid
-            self.master_fd = fd
-            self._set_pty_size(fd, ROWS, COLS)
-            self.is_running = True
-            # wait for first screen draw
-            self.wait_for_stable(timeout=3.0, require_nonblank=True)
-            if self._poll_child_exit():
-                screen = self._display_text().strip()
-                detail = (
-                    f"DCSS exited immediately. DCSS_BINARY={DCSS_BINARY!r}, "
-                    f"realpath={os.path.realpath(DCSS_BINARY)!r}."
-                )
-                if screen:
-                    detail += f"\nLast terminal output:\n{screen}"
-                raise RuntimeError(detail)
-            logger.info("DCSS started (pid=%d).", pid)
+        env = os.environ.copy()
+        env["HOME"] = str(HOME_DIR)
+        env["TERM"] = DCSS_TERM
+        env["LINES"] = str(ROWS)
+        env["COLUMNS"] = str(COLS)
+        env["DCSS_SAVE_DIR"] = str(SAVE_DIR)
+
+        exec_path, exec_args = self._build_exec_args(extra_args)
+
+        def _setup_child_tty() -> None:
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            self._set_pty_size(0, ROWS, COLS)
+
+        try:
+            self._process = subprocess.Popen(
+                exec_args,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=str(HOME_DIR),
+                env=env,
+                close_fds=True,
+                preexec_fn=_setup_child_tty,
+            )
+        finally:
+            os.close(slave_fd)
+
+        self.child_pid = self._process.pid
+        self.master_fd = master_fd
+        self._set_pty_size(master_fd, ROWS, COLS)
+        self.is_running = True
+        self.wait_for_stable(timeout=3.0, require_nonblank=True)
+        if self._poll_child_exit():
+            screen = self._display_text().strip()
+            detail = (
+                f"DCSS exited immediately. exec_path={exec_path!r}, "
+                f"args={exec_args!r}, DCSS_BINARY={DCSS_BINARY!r}, "
+                f"realpath={os.path.realpath(DCSS_BINARY)!r}."
+            )
+            if screen:
+                detail += f"\nLast terminal output:\n{screen}"
+            raise RuntimeError(detail)
+        logger.info("DCSS started (pid=%d).", self.child_pid)
 
     def stop(self) -> None:
         """Kill the DCSS process."""
@@ -179,6 +208,9 @@ class DcssEngine:
             "binary_exists": binary.exists(),
             "binary_executable": os.access(binary, os.X_OK),
             "term": DCSS_TERM,
+            "use_script": DCSS_USE_SCRIPT,
+            "script_binary": SCRIPT_BINARY,
+            "script_exists": Path(SCRIPT_BINARY).exists(),
             "rows": ROWS,
             "cols": COLS,
             "home": str(HOME_DIR),
@@ -270,27 +302,16 @@ class DcssEngine:
 
     # ── internals ───────────────────────────────────────────────────────
 
-    def _child_setup(self, extra_args: tuple[str, ...]) -> NoReturn:
-        """Set up the child process environment and exec crawl."""
-        os.chdir(str(HOME_DIR))
-        os.environ["HOME"] = str(HOME_DIR)
-        os.environ["TERM"] = DCSS_TERM
-        os.environ["LINES"] = str(ROWS)
-        os.environ["COLUMNS"] = str(COLS)
-        os.environ["DCSS_SAVE_DIR"] = str(SAVE_DIR)
-        self._set_pty_size(1, ROWS, COLS)
-
+    def _build_exec_args(self, extra_args: tuple[str, ...]) -> tuple[str, list[str]]:
         args = [DCSS_BINARY]
         args.extend(extra_args)
-        try:
-            os.execv(DCSS_BINARY, args)
-        except OSError as exc:
-            print(
-                f"exec failed for {DCSS_BINARY!r} "
-                f"(realpath={os.path.realpath(DCSS_BINARY)!r}): {exc}",
-                flush=True,
-            )
-            os._exit(127)  # noqa
+        exec_path = DCSS_BINARY
+        exec_args = args
+        if DCSS_USE_SCRIPT and Path(SCRIPT_BINARY).exists():
+            command = " ".join(shlex.quote(arg) for arg in args)
+            exec_path = SCRIPT_BINARY
+            exec_args = [SCRIPT_BINARY, "-q", "-f", "-e", "-c", command, "/dev/null"]
+        return exec_path, exec_args
 
     def _resolve_save_dir(self) -> Path:
         """DCSS saves inside ~/.crawl/saves/ by default."""
@@ -371,3 +392,4 @@ class DcssEngine:
         self.is_running = False
         self.master_fd = None
         self.child_pid = None
+        self._process = None
