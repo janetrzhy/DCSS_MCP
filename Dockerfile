@@ -30,8 +30,14 @@ RUN useradd -m -d /home/dcss dcss \
 
 USER dcss
 
-# DCSS init file — force ASCII mode for clean AI-readable output
-RUN mkdir -p /home/dcss/.crawl && echo "tile_display_mode = ascii" > /home/dcss/.crawl/init.txt
+# DCSS init file — force ASCII mode for clean AI-readable output.
+RUN mkdir -p /home/dcss/.crawl \
+    && echo "tile_display_mode = ascii" > /home/dcss/.crawl/init.txt
+
+# Crawl performs database and map initialisation before curses/terminal startup.
+# Build those caches into the image so a Render cold start does not spend its
+# first game launch CPU-bound with an intentionally blank terminal.
+RUN HOME=/home/dcss TERM=screen-256color /usr/games/crawl -builddb
 
 EXPOSE 8000
 
