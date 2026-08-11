@@ -1,8 +1,7 @@
 """DCSS process manager backed by tmux.
 
-The MCP server does not need to own a curses pty.  DCSS runs inside a tmux
+The MCP server does not need to own a curses pty. DCSS runs inside a tmux
 session, while tools read with ``capture-pane`` and act with ``send-keys``.
-This mirrors the most reliable CLI-agent setup and works well on Render.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ TMUX_SESSION = os.environ.get("DCSS_TMUX_SESSION", "dcss")
 SAVE_DIR = Path(os.environ.get("DCSS_SAVE_DIR", "/tmp/dcss-saves"))
 HOME_DIR = Path(os.environ.get("DCSS_HOME", "/tmp/dcss-home"))
 DCSS_TERM = os.environ.get("DCSS_TERM", "xterm-256color")
+STDERR_LOG = Path(os.environ.get("DCSS_STDERR_LOG", "/tmp/dcss-crawl-stderr.log"))
 
 COLS, ROWS = 80, 24
 SEND_WAIT_SEC = 0.18
@@ -43,6 +43,7 @@ class DcssEngine:
         """Start crawl in a fresh tmux session."""
         self._validate_runtime()
         self.stop()
+        STDERR_LOG.unlink(missing_ok=True)
 
         command = self._crawl_shell_command(extra_args)
         self._run_tmux(
@@ -187,7 +188,10 @@ class DcssEngine:
         crawl += "".join(f" {_sh(arg)}" for arg in extra_args)
         parts = [
             f"cd {_sh(HOME_DIR)}",
-            f"{crawl}; code=$?; printf '\\nDCSS_PROCESS_EXITED code=%s\\n' \"$code\"; sleep 300",
+            (
+                f"{crawl} 2>{_sh(STDERR_LOG)}; code=$?; "
+                "printf '\\nDCSS_PROCESS_EXITED code=%s\\n' \"$code\"; sleep 300"
+            ),
         ]
         return " && ".join(parts)
 
@@ -243,7 +247,7 @@ class DcssEngine:
             return {"tmux_pane": f"<unavailable: {exc}>"}
 
     def _tty_diagnostics(self) -> str:
-        """Inspect the pane tty, foreground process group and Crawl's stdio."""
+        """Inspect pane tty plus Crawl process state without ptrace."""
         if not self.is_running:
             return "<no tmux session>"
         try:
@@ -273,25 +277,6 @@ class DcssEngine:
                 )
                 chunks.append("stty=" + ((stty.stdout or stty.stderr).strip() or "<blank>"))
 
-                fg = subprocess.run(
-                    [
-                        "python",
-                        "-c",
-                        (
-                            "import os; "
-                            f"fd=os.open({pane_tty!r}, os.O_RDONLY|os.O_NOCTTY); "
-                            "print(os.tcgetpgrp(fd)); os.close(fd)"
-                        ),
-                    ],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                )
-                chunks.append(
-                    "tty_foreground_pgrp=" + ((fg.stdout or fg.stderr).strip() or "<blank>")
-                )
-
             pgrep = subprocess.run(
                 ["pgrep", "-x", "crawl"],
                 check=False,
@@ -302,7 +287,7 @@ class DcssEngine:
             for pid in pgrep.stdout.split():
                 proc = Path("/proc") / pid
                 details = [f"crawl_pid={pid}"]
-                for name in ("wchan", "status", "cmdline"):
+                for name in ("wchan", "status", "cmdline", "syscall"):
                     try:
                         text = (proc / name).read_text(encoding="utf-8", errors="replace")
                         if name == "cmdline":
@@ -310,13 +295,54 @@ class DcssEngine:
                         details.append(f"{name}={text.strip()[:1800]}")
                     except Exception as exc:
                         details.append(f"{name}=<error: {exc}>")
+
+                try:
+                    stat1 = (proc / "stat").read_text(encoding="utf-8", errors="replace")
+                    fields1 = stat1.split()
+                    utime1, stime1 = int(fields1[13]), int(fields1[14])
+                    time.sleep(0.25)
+                    stat2 = (proc / "stat").read_text(encoding="utf-8", errors="replace")
+                    fields2 = stat2.split()
+                    utime2, stime2 = int(fields2[13]), int(fields2[14])
+                    details.append(
+                        "cpu_ticks_250ms="
+                        f"user:+{utime2 - utime1} system:+{stime2 - stime1} "
+                        f"total_before={utime1 + stime1} total_after={utime2 + stime2}"
+                    )
+                except Exception as exc:
+                    details.append(f"cpu_ticks_250ms=<error: {exc}>")
+
+                try:
+                    env = (proc / "environ").read_bytes().replace(b"\x00", b"\n").decode(
+                        "utf-8", errors="replace"
+                    )
+                    keep = [
+                        line
+                        for line in env.splitlines()
+                        if line.startswith(("HOME=", "TERM=", "LINES=", "COLUMNS=", "LANG=", "LC_"))
+                    ]
+                    details.append("environment=" + " ".join(keep))
+                except Exception as exc:
+                    details.append(f"environment=<error: {exc}>")
+
                 for fdname in ("fd/0", "fd/1", "fd/2"):
                     try:
                         details.append(f"{fdname}={os.readlink(proc / fdname)}")
                     except Exception as exc:
                         details.append(f"{fdname}=<error: {exc}>")
                 chunks.append("\n".join(details))
+
+            chunks.append("startup_stderr=" + self._read_startup_stderr())
             return "\n".join(chunks)
+        except Exception as exc:
+            return f"<unavailable: {exc}>"
+
+    def _read_startup_stderr(self) -> str:
+        try:
+            if not STDERR_LOG.exists():
+                return "<file not created>"
+            text = STDERR_LOG.read_text(encoding="utf-8", errors="replace")
+            return text[-4000:] if text else "<empty>"
         except Exception as exc:
             return f"<unavailable: {exc}>"
 
@@ -370,7 +396,6 @@ def _split_tmux_keys(keys: str) -> list[str]:
         return ["Enter"]
 
     out: list[str] = []
-    i = 0
     special = {
         "\r": "Enter",
         "\n": "Enter",
@@ -378,11 +403,6 @@ def _split_tmux_keys(keys: str) -> list[str]:
         "\x1b": "Escape",
         " ": "Space",
     }
-    while i < len(keys):
-        ch = keys[i]
-        if ch in special:
-            out.append(special[ch])
-        else:
-            out.append(ch)
-        i += 1
+    for ch in keys:
+        out.append(special.get(ch, ch))
     return out
