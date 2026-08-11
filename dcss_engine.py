@@ -24,6 +24,7 @@ STDERR_LOG = Path(os.environ.get("DCSS_STDERR_LOG", "/tmp/dcss-crawl-stderr.log"
 COLS, ROWS = 80, 24
 SEND_WAIT_SEC = 0.18
 SCREEN_STABLE_SEC = 0.35
+STARTUP_PEEK_SEC = 2.0
 
 
 class DcssEngine:
@@ -31,6 +32,7 @@ class DcssEngine:
 
     def __init__(self):
         self.session_name = TMUX_SESSION
+        self.started_at: float | None = None
         HOME_DIR.mkdir(parents=True, exist_ok=True)
         SAVE_DIR.mkdir(parents=True, exist_ok=True)
         self._ensure_home_config()
@@ -39,8 +41,14 @@ class DcssEngine:
     def is_running(self) -> bool:
         return self._tmux_ok("has-session", "-t", self.session_name)
 
+    @property
+    def startup_elapsed_sec(self) -> float | None:
+        if self.started_at is None or not self.is_running:
+            return None
+        return max(0.0, time.monotonic() - self.started_at)
+
     def start(self, *extra_args: str) -> None:
-        """Start crawl in a fresh tmux session."""
+        """Start crawl in a fresh tmux session without assuming fast startup."""
         self._validate_runtime()
         self.stop()
         STDERR_LOG.unlink(missing_ok=True)
@@ -57,7 +65,12 @@ class DcssEngine:
             str(ROWS),
             command,
         )
-        self.wait_for_stable(timeout=8.0, require_nonblank=True)
+        self.started_at = time.monotonic()
+
+        # Render can heavily throttle CPU. Give Crawl a brief chance to paint,
+        # but do not treat a still-blank pane as a startup failure. The process
+        # keeps running and later read_screen() calls observe the same session.
+        self.wait_for_stable(timeout=STARTUP_PEEK_SEC, require_nonblank=True)
         screen = self.read_screen()
         if "DCSS_PROCESS_EXITED" in screen:
             raise RuntimeError(f"DCSS exited during startup.\n{screen}")
@@ -67,6 +80,7 @@ class DcssEngine:
     def stop(self) -> None:
         if self.is_running:
             self._run_tmux("kill-session", "-t", self.session_name, check=False)
+        self.started_at = None
 
     def send_keys(self, keys: str) -> None:
         if not self.is_running:
@@ -148,6 +162,7 @@ class DcssEngine:
         crawl = Path(DCSS_BINARY)
         tmux = Path(TMUX_BINARY)
         screen = self.read_screen()
+        elapsed = self.startup_elapsed_sec
         return {
             "backend": "tmux",
             "is_running": self.is_running,
@@ -171,6 +186,7 @@ class DcssEngine:
             "cols": COLS,
             "home": str(HOME_DIR),
             "save_dir": str(self._resolve_save_dir()),
+            "startup_elapsed_sec": round(elapsed, 1) if elapsed is not None else None,
             "screen_chars": len(screen),
             "screen_nonblank_chars": len(screen.strip()),
             "raw_tail_chars": 0,
@@ -286,6 +302,14 @@ class DcssEngine:
             )
             for pid in pgrep.stdout.split():
                 proc = Path("/proc") / pid
+                try:
+                    status_text = (proc / "status").read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    status_text = ""
+                # Ignore unreaped Crawl zombies from an older tmux session.
+                if "State:\tZ" in status_text or "State:\tZ (zombie)" in status_text:
+                    continue
+
                 details = [f"crawl_pid={pid}"]
                 for name in ("wchan", "status", "cmdline", "syscall"):
                     try:
@@ -359,6 +383,7 @@ class DcssEngine:
                 line
                 for line in result.stdout.splitlines()
                 if any(token in line for token in ("tmux", "crawl", "sh", "python"))
+                and "<defunct>" not in line
             ]
             return "\n".join(lines[:40]) + "\nTTY diagnostics:\n" + self._tty_diagnostics()
         except Exception as exc:
