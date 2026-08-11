@@ -16,7 +16,7 @@ RUN test -x /usr/games/crawl \
     && grep -q "0.34.1" /tmp/crawl-version.txt \
     && infocmp screen-256color >/dev/null
 
-ENV DCSS_BINARY=/app/crawl_wrapper.sh
+ENV DCSS_BINARY=/usr/games/crawl
 ENV DCSS_TERM=screen-256color
 ENV DCSS_HOME=/home/dcss
 
@@ -28,7 +28,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Application code
 COPY . .
-RUN chmod +x /app/crawl_wrapper.sh
 
 RUN useradd -m -d /home/dcss dcss \
     && chown -R dcss:dcss /app
