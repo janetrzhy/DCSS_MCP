@@ -181,7 +181,7 @@ class DcssEngine:
     def _crawl_shell_command(self, extra_args: tuple[str, ...]) -> str:
         crawl = (
             f"env HOME={_sh(HOME_DIR)} TERM={_sh(DCSS_TERM)} "
-            f"LINES={ROWS} COLUMNS={COLS} DCSS_SAVE_DIR={_sh(SAVE_DIR)} "
+            f"LINES={ROWS} COLUMNS={COLS} "
             f"{_sh(DCSS_BINARY)}"
         )
         crawl += "".join(f" {_sh(arg)}" for arg in extra_args)
@@ -242,10 +242,88 @@ class DcssEngine:
         except Exception as exc:
             return {"tmux_pane": f"<unavailable: {exc}>"}
 
+    def _tty_diagnostics(self) -> str:
+        """Inspect the pane tty, foreground process group and Crawl's stdio."""
+        if not self.is_running:
+            return "<no tmux session>"
+        try:
+            pane = self._run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.session_name,
+                "#{pane_pid}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}",
+            ).stdout.strip()
+            fields = pane.split("|", 3)
+            while len(fields) < 4:
+                fields.append("")
+            pane_pid, pane_tty, pane_cmd, pane_cwd = fields
+            chunks = [
+                f"pane_pid={pane_pid} pane_tty={pane_tty} "
+                f"pane_command={pane_cmd} pane_cwd={pane_cwd}"
+            ]
+
+            if pane_tty:
+                stty = subprocess.run(
+                    ["sh", "-lc", f"stty -a < {_sh(pane_tty)}"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                chunks.append("stty=" + ((stty.stdout or stty.stderr).strip() or "<blank>"))
+
+                fg = subprocess.run(
+                    [
+                        "python",
+                        "-c",
+                        (
+                            "import os; "
+                            f"fd=os.open({pane_tty!r}, os.O_RDONLY|os.O_NOCTTY); "
+                            "print(os.tcgetpgrp(fd)); os.close(fd)"
+                        ),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                chunks.append(
+                    "tty_foreground_pgrp=" + ((fg.stdout or fg.stderr).strip() or "<blank>")
+                )
+
+            pgrep = subprocess.run(
+                ["pgrep", "-x", "crawl"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            for pid in pgrep.stdout.split():
+                proc = Path("/proc") / pid
+                details = [f"crawl_pid={pid}"]
+                for name in ("wchan", "status", "cmdline"):
+                    try:
+                        text = (proc / name).read_text(encoding="utf-8", errors="replace")
+                        if name == "cmdline":
+                            text = text.replace("\x00", " ")
+                        details.append(f"{name}={text.strip()[:1800]}")
+                    except Exception as exc:
+                        details.append(f"{name}=<error: {exc}>")
+                for fdname in ("fd/0", "fd/1", "fd/2"):
+                    try:
+                        details.append(f"{fdname}={os.readlink(proc / fdname)}")
+                    except Exception as exc:
+                        details.append(f"{fdname}=<error: {exc}>")
+                chunks.append("\n".join(details))
+            return "\n".join(chunks)
+        except Exception as exc:
+            return f"<unavailable: {exc}>"
+
     def _process_table(self) -> str:
         try:
             result = subprocess.run(
-                ["ps", "-eo", "pid,ppid,pgid,sid,stat,comm,args"],
+                ["ps", "-eo", "pid,ppid,pgid,sid,tpgid,tty,stat,wchan:24,comm,args"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -256,7 +334,7 @@ class DcssEngine:
                 for line in result.stdout.splitlines()
                 if any(token in line for token in ("tmux", "crawl", "sh", "python"))
             ]
-            return "\n".join(lines[:40])
+            return "\n".join(lines[:40]) + "\nTTY diagnostics:\n" + self._tty_diagnostics()
         except Exception as exc:
             return f"<unavailable: {exc}>"
 
