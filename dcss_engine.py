@@ -1,8 +1,7 @@
 """DCSS process manager backed by tmux.
 
-The MCP server does not need to own a curses pty.  DCSS runs inside a tmux
+The MCP server does not need to own a curses pty. DCSS runs inside a tmux
 session, while tools read with ``capture-pane`` and act with ``send-keys``.
-This mirrors the most reliable CLI-agent setup and works well on Render.
 """
 
 from __future__ import annotations
@@ -20,10 +19,12 @@ TMUX_SESSION = os.environ.get("DCSS_TMUX_SESSION", "dcss")
 SAVE_DIR = Path(os.environ.get("DCSS_SAVE_DIR", "/tmp/dcss-saves"))
 HOME_DIR = Path(os.environ.get("DCSS_HOME", "/tmp/dcss-home"))
 DCSS_TERM = os.environ.get("DCSS_TERM", "xterm-256color")
+STDERR_LOG = Path(os.environ.get("DCSS_STDERR_LOG", "/tmp/dcss-crawl-stderr.log"))
 
 COLS, ROWS = 80, 24
 SEND_WAIT_SEC = 0.18
 SCREEN_STABLE_SEC = 0.35
+STARTUP_PEEK_SEC = 2.0
 
 
 class DcssEngine:
@@ -31,6 +32,7 @@ class DcssEngine:
 
     def __init__(self):
         self.session_name = TMUX_SESSION
+        self.started_at: float | None = None
         HOME_DIR.mkdir(parents=True, exist_ok=True)
         SAVE_DIR.mkdir(parents=True, exist_ok=True)
         self._ensure_home_config()
@@ -39,10 +41,17 @@ class DcssEngine:
     def is_running(self) -> bool:
         return self._tmux_ok("has-session", "-t", self.session_name)
 
+    @property
+    def startup_elapsed_sec(self) -> float | None:
+        if self.started_at is None or not self.is_running:
+            return None
+        return max(0.0, time.monotonic() - self.started_at)
+
     def start(self, *extra_args: str) -> None:
-        """Start crawl in a fresh tmux session."""
+        """Start crawl in a fresh tmux session without assuming fast startup."""
         self._validate_runtime()
         self.stop()
+        STDERR_LOG.unlink(missing_ok=True)
 
         command = self._crawl_shell_command(extra_args)
         self._run_tmux(
@@ -56,7 +65,12 @@ class DcssEngine:
             str(ROWS),
             command,
         )
-        self.wait_for_stable(timeout=8.0, require_nonblank=True)
+        self.started_at = time.monotonic()
+
+        # Render can heavily throttle CPU. Give Crawl a brief chance to paint,
+        # but do not treat a still-blank pane as a startup failure. The process
+        # keeps running and later read_screen() calls observe the same session.
+        self.wait_for_stable(timeout=STARTUP_PEEK_SEC, require_nonblank=True)
         screen = self.read_screen()
         if "DCSS_PROCESS_EXITED" in screen:
             raise RuntimeError(f"DCSS exited during startup.\n{screen}")
@@ -66,6 +80,7 @@ class DcssEngine:
     def stop(self) -> None:
         if self.is_running:
             self._run_tmux("kill-session", "-t", self.session_name, check=False)
+        self.started_at = None
 
     def send_keys(self, keys: str) -> None:
         if not self.is_running:
@@ -147,6 +162,7 @@ class DcssEngine:
         crawl = Path(DCSS_BINARY)
         tmux = Path(TMUX_BINARY)
         screen = self.read_screen()
+        elapsed = self.startup_elapsed_sec
         return {
             "backend": "tmux",
             "is_running": self.is_running,
@@ -170,6 +186,7 @@ class DcssEngine:
             "cols": COLS,
             "home": str(HOME_DIR),
             "save_dir": str(self._resolve_save_dir()),
+            "startup_elapsed_sec": round(elapsed, 1) if elapsed is not None else None,
             "screen_chars": len(screen),
             "screen_nonblank_chars": len(screen.strip()),
             "raw_tail_chars": 0,
@@ -181,13 +198,16 @@ class DcssEngine:
     def _crawl_shell_command(self, extra_args: tuple[str, ...]) -> str:
         crawl = (
             f"env HOME={_sh(HOME_DIR)} TERM={_sh(DCSS_TERM)} "
-            f"LINES={ROWS} COLUMNS={COLS} DCSS_SAVE_DIR={_sh(SAVE_DIR)} "
+            f"LINES={ROWS} COLUMNS={COLS} "
             f"{_sh(DCSS_BINARY)}"
         )
         crawl += "".join(f" {_sh(arg)}" for arg in extra_args)
         parts = [
             f"cd {_sh(HOME_DIR)}",
-            f"{crawl}; code=$?; printf '\\nDCSS_PROCESS_EXITED code=%s\\n' \"$code\"; sleep 300",
+            (
+                f"{crawl} 2>{_sh(STDERR_LOG)}; code=$?; "
+                "printf '\\nDCSS_PROCESS_EXITED code=%s\\n' \"$code\"; sleep 300"
+            ),
         ]
         return " && ".join(parts)
 
@@ -242,10 +262,118 @@ class DcssEngine:
         except Exception as exc:
             return {"tmux_pane": f"<unavailable: {exc}>"}
 
+    def _tty_diagnostics(self) -> str:
+        """Inspect pane tty plus Crawl process state without ptrace."""
+        if not self.is_running:
+            return "<no tmux session>"
+        try:
+            pane = self._run_tmux(
+                "display-message",
+                "-p",
+                "-t",
+                self.session_name,
+                "#{pane_pid}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}",
+            ).stdout.strip()
+            fields = pane.split("|", 3)
+            while len(fields) < 4:
+                fields.append("")
+            pane_pid, pane_tty, pane_cmd, pane_cwd = fields
+            chunks = [
+                f"pane_pid={pane_pid} pane_tty={pane_tty} "
+                f"pane_command={pane_cmd} pane_cwd={pane_cwd}"
+            ]
+
+            if pane_tty:
+                stty = subprocess.run(
+                    ["sh", "-lc", f"stty -a < {_sh(pane_tty)}"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                chunks.append("stty=" + ((stty.stdout or stty.stderr).strip() or "<blank>"))
+
+            pgrep = subprocess.run(
+                ["pgrep", "-x", "crawl"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            for pid in pgrep.stdout.split():
+                proc = Path("/proc") / pid
+                try:
+                    status_text = (proc / "status").read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    status_text = ""
+                # Ignore unreaped Crawl zombies from an older tmux session.
+                if "State:\tZ" in status_text or "State:\tZ (zombie)" in status_text:
+                    continue
+
+                details = [f"crawl_pid={pid}"]
+                for name in ("wchan", "status", "cmdline", "syscall"):
+                    try:
+                        text = (proc / name).read_text(encoding="utf-8", errors="replace")
+                        if name == "cmdline":
+                            text = text.replace("\x00", " ")
+                        details.append(f"{name}={text.strip()[:1800]}")
+                    except Exception as exc:
+                        details.append(f"{name}=<error: {exc}>")
+
+                try:
+                    stat1 = (proc / "stat").read_text(encoding="utf-8", errors="replace")
+                    fields1 = stat1.split()
+                    utime1, stime1 = int(fields1[13]), int(fields1[14])
+                    time.sleep(0.25)
+                    stat2 = (proc / "stat").read_text(encoding="utf-8", errors="replace")
+                    fields2 = stat2.split()
+                    utime2, stime2 = int(fields2[13]), int(fields2[14])
+                    details.append(
+                        "cpu_ticks_250ms="
+                        f"user:+{utime2 - utime1} system:+{stime2 - stime1} "
+                        f"total_before={utime1 + stime1} total_after={utime2 + stime2}"
+                    )
+                except Exception as exc:
+                    details.append(f"cpu_ticks_250ms=<error: {exc}>")
+
+                try:
+                    env = (proc / "environ").read_bytes().replace(b"\x00", b"\n").decode(
+                        "utf-8", errors="replace"
+                    )
+                    keep = [
+                        line
+                        for line in env.splitlines()
+                        if line.startswith(("HOME=", "TERM=", "LINES=", "COLUMNS=", "LANG=", "LC_"))
+                    ]
+                    details.append("environment=" + " ".join(keep))
+                except Exception as exc:
+                    details.append(f"environment=<error: {exc}>")
+
+                for fdname in ("fd/0", "fd/1", "fd/2"):
+                    try:
+                        details.append(f"{fdname}={os.readlink(proc / fdname)}")
+                    except Exception as exc:
+                        details.append(f"{fdname}=<error: {exc}>")
+                chunks.append("\n".join(details))
+
+            chunks.append("startup_stderr=" + self._read_startup_stderr())
+            return "\n".join(chunks)
+        except Exception as exc:
+            return f"<unavailable: {exc}>"
+
+    def _read_startup_stderr(self) -> str:
+        try:
+            if not STDERR_LOG.exists():
+                return "<file not created>"
+            text = STDERR_LOG.read_text(encoding="utf-8", errors="replace")
+            return text[-4000:] if text else "<empty>"
+        except Exception as exc:
+            return f"<unavailable: {exc}>"
+
     def _process_table(self) -> str:
         try:
             result = subprocess.run(
-                ["ps", "-eo", "pid,ppid,pgid,sid,stat,comm,args"],
+                ["ps", "-eo", "pid,ppid,pgid,sid,tpgid,tty,stat,wchan:24,comm,args"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -255,8 +383,9 @@ class DcssEngine:
                 line
                 for line in result.stdout.splitlines()
                 if any(token in line for token in ("tmux", "crawl", "sh", "python"))
+                and "<defunct>" not in line
             ]
-            return "\n".join(lines[:40])
+            return "\n".join(lines[:40]) + "\nTTY diagnostics:\n" + self._tty_diagnostics()
         except Exception as exc:
             return f"<unavailable: {exc}>"
 
@@ -292,7 +421,6 @@ def _split_tmux_keys(keys: str) -> list[str]:
         return ["Enter"]
 
     out: list[str] = []
-    i = 0
     special = {
         "\r": "Enter",
         "\n": "Enter",
@@ -300,11 +428,6 @@ def _split_tmux_keys(keys: str) -> list[str]:
         "\x1b": "Escape",
         " ": "Space",
     }
-    while i < len(keys):
-        ch = keys[i]
-        if ch in special:
-            out.append(special[ch])
-        else:
-            out.append(ch)
-        i += 1
+    for ch in keys:
+        out.append(special.get(ch, ch))
     return out

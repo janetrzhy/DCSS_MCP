@@ -1,9 +1,9 @@
 """DCSS MCP Server — expose Dungeon Crawl Stone Soup as MCP tools.
 
-claude.ai / ChatGPT  <->  Streamable HTTP or SSE  <->  pty  <->  crawl
+claude.ai / ChatGPT  <->  Streamable HTTP or SSE  <->  tmux pty  <->  crawl
 
 Tools:
-  start_game()     - fresh game, ready to play
+  start_game()     - fresh game, ready to play or initializing
   read_screen()    - current 80x24 terminal content
   send_keys(str)   - keystrokes to game
   start_new_game() - compatibility alias
@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server")
 
-SERVER_VERSION = "2026-07-26-tmux-crawl-v1"
+SERVER_VERSION = "2026-08-11-tmux-crawl-v2"
 DEPLOY_COMMIT = (
     os.environ.get("RENDER_GIT_COMMIT")
     or os.environ.get("RENDER_COMMIT")
@@ -42,14 +42,18 @@ DEPLOY_COMMIT = (
 
 MCP_INSTRUCTIONS = """
 This MCP server lets the assistant play Dungeon Crawl Stone Soup through tools.
-To begin a run, call start_game() first. After that, repeatedly call
-read_screen() and send_keys(keys) to inspect the terminal and act in game.
+To begin a run, call start_game() first. Render may CPU-throttle Crawl during
+map initialization. If start_game() returns INITIALIZING, do NOT call
+start_game() again because that would throw away the progress; call
+read_screen() on the same session until the menu or game appears. After that,
+use read_screen() and send_keys(keys) to inspect the terminal and act in game.
 Do not merely explain the controls when the user asks to play; use the tools.
 """
 
 mcp = FastMCP("DCSS Game Server", instructions=MCP_INSTRUCTIONS)
 engine = DcssEngine()
 pg = PgStore()
+_pending_autoplay: dict[str, str] | None = None
 
 # ── Tools ─────────────────────────────────────────────────────────────
 
@@ -94,6 +98,24 @@ def _normalize_keys(keys: str) -> str:
     return "".join(out)
 
 
+def _finish_pending_autoplay(screen: str) -> str:
+    """Finish the old auto-play shortcut once delayed startup finally paints."""
+    global _pending_autoplay
+    if not _pending_autoplay or not screen.strip():
+        return screen
+
+    weapon = _pending_autoplay.get("weapon", "")
+    # This mirrors the previous behaviour: CLI options preselect the character,
+    # then Enter accepts the initial menu once it finally appears.
+    engine.send_keys("\r")
+    screen = engine.wait_for_stable(timeout=3.0)
+    if weapon and "choice of weapons" in screen.lower():
+        engine.send_keys(weapon[:1])
+        screen = engine.wait_for_stable(timeout=3.0)
+    _pending_autoplay = None
+    return screen
+
+
 async def _start_game_impl(
     auto_play: bool = True,
     name: str = "MCP",
@@ -101,41 +123,50 @@ async def _start_game_impl(
     background: str = "Be",
     weapon: str = "c",
 ) -> str:
-    """Start crawl and optionally enter the preselected default game."""
+    """Start Crawl without assuming Render can finish initialization quickly."""
+    global _pending_autoplay
     engine.stop()
     engine.clean_save_files()
     extra_args: list[str] = []
     if auto_play:
         extra_args = ["-name", name, "-species", species, "-background", background]
+        _pending_autoplay = {"weapon": weapon}
+    else:
+        _pending_autoplay = None
 
     engine.start(*extra_args)
-    screen = engine.wait_for_stable(timeout=10.0, require_nonblank=True)
-
+    screen = engine.read_screen()
     if auto_play and screen.strip():
-        engine.send_keys("\r")
-        screen = engine.wait_for_stable(timeout=8.0)
-        if weapon and "choice of weapons" in screen.lower():
-            engine.send_keys(weapon[:1])
-            screen = engine.wait_for_stable(timeout=8.0)
-
+        screen = _finish_pending_autoplay(screen)
     return screen
 
 
 def _screen_or_blank_diagnostic(screen: str) -> str:
     if screen.strip():
         return screen
+
     diag = engine.diagnostics()
+    elapsed = diag.get("startup_elapsed_sec")
+    elapsed_text = f"{elapsed:.1f}s" if isinstance(elapsed, (int, float)) else "unknown"
+
+    # For the first two minutes, a blank terminal is now treated as a normal
+    # initialization state. Render runtime CPU can be much slower than image
+    # build CPU, and Crawl loads all map definitions before painting the menu.
+    if isinstance(elapsed, (int, float)) and elapsed < 120:
+        return (
+            f"INITIALIZING - DCSS process is alive but has not painted the terminal yet "
+            f"(elapsed={elapsed_text}).\n"
+            "Do NOT call start_game() again; that would restart map initialization. "
+            "Call read_screen() again on this same session."
+        )
+
     lines = [
-        "SCREEN BLANK - DCSS process is running but pyte rendered no visible terminal cells.",
+        "STARTUP STILL BLANK - DCSS process is alive but has not painted the terminal.",
+        f"startup_elapsed={elapsed_text}",
         f"server_version={SERVER_VERSION} commit={DEPLOY_COMMIT}",
-        f"pid={diag['child_pid']} fd={diag['master_fd']} TERM={diag['term']} size={diag['cols']}x{diag['rows']} terminfo={diag['terminfo']}",
-        f"script_launcher={diag['use_script']} {diag['script_binary']} exists={diag['script_exists']}",
+        f"TERM={diag['term']} size={diag['cols']}x{diag['rows']} terminfo={diag['terminfo']}",
         f"binary={diag['binary']} realpath={diag['binary_realpath']}",
-        f"raw_tail_chars={diag['raw_tail_chars']}",
     ]
-    if diag["raw_tail_preview"]:
-        lines.append("raw_tail_preview:")
-        lines.append(diag["raw_tail_preview"])
     if diag["proc"]:
         lines.append("proc:")
         for key in ("tmux_pane", "cmdline", "status", "wchan", "cwd", "exe"):
@@ -151,14 +182,17 @@ def _screen_or_blank_diagnostic(screen: str) -> str:
 @mcp.tool(
     description=(
         "Read the current DCSS game screen as ASCII text (80x24 terminal). "
-        "Shows status lines (HP, MP, depth, turns), the map view, "
-        "message lines, and prompts (--more--, y/n, etc.)."
+        "If the process is still loading maps, returns INITIALIZING; keep using "
+        "read_screen() on the same session rather than restarting the game."
     )
 )
 async def read_screen() -> str:
     if not engine.is_running:
         return "NO GAME RUNNING — use start_game(), start_new_game(), or load_game() first."
-    return _screen_or_blank_diagnostic(engine.read_screen())
+    screen = engine.read_screen()
+    if screen.strip() and _pending_autoplay:
+        screen = _finish_pending_autoplay(screen)
+    return _screen_or_blank_diagnostic(screen)
 
 
 @mcp.tool(
@@ -172,11 +206,16 @@ async def read_screen() -> str:
     )
 )
 async def send_keys(keys: str = "") -> str:
+    global _pending_autoplay
     if not engine.is_running:
         return "NO GAME RUNNING — use start_game(), start_new_game(), or load_game() first."
     if not keys:
-        return _screen_or_blank_diagnostic(engine.read_screen())
+        screen = engine.read_screen()
+        if screen.strip() and _pending_autoplay:
+            screen = _finish_pending_autoplay(screen)
+        return _screen_or_blank_diagnostic(screen)
     try:
+        _pending_autoplay = None
         engine.send_keys(_normalize_keys(keys))
         screen = engine.wait_for_stable(timeout=2.0)
         return _screen_or_blank_diagnostic(screen)
@@ -187,13 +226,11 @@ async def send_keys(keys: str = "") -> str:
 
 @mcp.tool(
     description=(
-        "Start a fresh DCSS game. Any current game is terminated first.\n\n"
-        "By default auto_play=true, which preselects a simple Minotaur "
-        "Berserker using name/species/background and presses Enter on the "
-        "initial Dungeon Crawl menu. Pass custom name/species/background to "
-        "preselect a different character. If DCSS asks for a starting weapon, "
-        "the weapon argument sends that one-letter choice; pass weapon='' to "
-        "stop at weapon selection. Set auto_play=false to stop at the menu."
+        "Start a fresh DCSS game. Any current game is terminated first. Render "
+        "may take longer than a normal desktop to load Crawl's maps; if this "
+        "returns INITIALIZING, keep calling read_screen() and do not restart.\n\n"
+        "By default auto_play=true preselects a Minotaur Berserker. Set "
+        "auto_play=false to stop at the menu."
     )
 )
 async def start_game(
@@ -203,7 +240,7 @@ async def start_game(
     background: str = "Be",
     weapon: str = "c",
 ) -> str:
-    """Start a fresh game, defaulting to the quickest playable character."""
+    """Start a fresh game, allowing initialization to continue asynchronously."""
     try:
         screen = await _start_game_impl(
             auto_play=auto_play,
@@ -278,16 +315,16 @@ async def save_game(slot: str = "latest") -> str:
 
             engine.restore_save_files(files)
             engine.start()
-            screen = engine.wait_for_stable(timeout=6.0)
+            screen = engine.read_screen()
             return (
                 f"✓ Saved game to slot '{slot}' ({len(files)} files).\n"
-                f"Game restarted — you can continue playing.\n"
-                f"{screen}"
+                f"Game process restarted.\n"
+                f"{_screen_or_blank_diagnostic(screen)}"
             )
         else:
             engine.start()
-            screen = engine.wait_for_stable(timeout=6.0)
-            return f"No save files found. Starting new game.\n{screen}"
+            screen = engine.read_screen()
+            return f"No save files found. Starting new game.\n{_screen_or_blank_diagnostic(screen)}"
 
     except Exception as exc:
         logger.exception("save_game failed")
@@ -318,8 +355,7 @@ async def load_game(slot: str = "latest") -> str:
         engine.clean_save_files()
         engine.restore_save_files(files)
         engine.start()
-        screen = engine.wait_for_stable(timeout=6.0)
-        return screen
+        return _screen_or_blank_diagnostic(engine.read_screen())
     except Exception as exc:
         logger.exception("load_game failed")
         return f"ERROR loading game: {exc}"
@@ -376,13 +412,9 @@ async def server_info() -> str:
         f"DCSS binary exists/executable: {diag['binary_exists']}/{diag['binary_executable']}",
         f"tmux: {diag.get('tmux_binary', '?')} exists={diag.get('tmux_exists', '?')} session={diag.get('session', '?')}",
         f"TERM: {diag['term']}  size: {diag['cols']}x{diag['rows']} terminfo={diag['terminfo']}",
-        f"script launcher: {diag['use_script']} {diag['script_binary']} exists={diag['script_exists']}",
-        f"Running: {diag['is_running']}  pid: {diag['child_pid']}  fd: {diag['master_fd']}",
-        f"Screen nonblank chars: {diag['screen_nonblank_chars']}  raw tail chars: {diag['raw_tail_chars']}",
+        f"Running: {diag['is_running']} startup_elapsed={diag.get('startup_elapsed_sec')}s",
+        f"Screen nonblank chars: {diag['screen_nonblank_chars']}",
     ]
-    if diag["raw_tail_preview"]:
-        lines.append("Raw tail preview:")
-        lines.append(diag["raw_tail_preview"])
     if diag["proc"]:
         lines.append("Process diagnostics:")
         for key in ("tmux_pane", "cmdline", "status", "wchan", "cwd", "exe"):
@@ -396,7 +428,7 @@ async def server_info() -> str:
 
 
 @mcp.tool(
-    description="Quick check whether DCSS is running and responding."
+    description="Quick check whether DCSS is running, initializing, or ready."
 )
 async def game_status() -> str:
     prefix = f"DCSS MCP {SERVER_VERSION} commit={DEPLOY_COMMIT}\n"
@@ -411,20 +443,11 @@ async def game_status() -> str:
         )
     try:
         screen = engine.read_screen()
-        diag = engine.diagnostics()
+        if not screen.strip():
+            return prefix + _screen_or_blank_diagnostic(screen)
         if len(screen) > 300:
-            return (
-                prefix
-                + f"DCSS is RUNNING. pid={diag['child_pid']} "
-                + f"screen_nonblank={diag['screen_nonblank_chars']} raw_tail={diag['raw_tail_chars']}\n"
-                + f"(Preview)\n{screen[:300]}..."
-            )
-        return (
-            prefix
-            + f"DCSS is RUNNING. pid={diag['child_pid']} "
-            + f"screen_nonblank={diag['screen_nonblank_chars']} raw_tail={diag['raw_tail_chars']}\n"
-            + screen
-        )
+            return prefix + "DCSS is READY/RUNNING.\n" + f"(Preview)\n{screen[:300]}..."
+        return prefix + "DCSS is READY/RUNNING.\n" + screen
     except Exception as exc:
         return prefix + f"DCSS is RUNNING but screen read error: {exc}"
 
@@ -437,6 +460,12 @@ def _save_on_exit():
     if not engine.is_running:
         return
     try:
+        # If Crawl has not painted anything yet, it is still initializing and
+        # there is no game state to save. Do not inject keystrokes into startup.
+        if not engine.read_screen().strip():
+            logger.info("Shutdown during Crawl initialization; stopping session without save.")
+            return
+
         logger.info("Shutdown: saving game...")
         engine.send_keys("S")
         time.sleep(1.5)
