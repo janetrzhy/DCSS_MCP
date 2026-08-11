@@ -9,10 +9,12 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN test -x /usr/games/crawl \
-    && /usr/games/crawl -version
+    && /usr/games/crawl -version \
+    && infocmp screen-256color >/dev/null
 
 ENV DCSS_BINARY=/usr/games/crawl
-ENV DCSS_TERM=vt100
+ENV DCSS_TERM=screen-256color
+ENV DCSS_HOME=/home/dcss
 
 WORKDIR /app
 
