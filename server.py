@@ -1,26 +1,20 @@
-"""DCSS MCP Server — expose Dungeon Crawl Stone Soup as MCP tools.
+"""DCSS MCP Server — play Dungeon Crawl Stone Soup through MCP.
 
-claude.ai / ChatGPT  <->  Streamable HTTP or SSE  <->  tmux pty  <->  crawl
+The server intentionally runs one live Crawl session at a time, while
+PostgreSQL can hold any number of independent profiles and checkpoints.
 
-Tools:
-  start_game()     - fresh game, ready to play or initializing
-  read_screen()    - current 80x24 terminal content
-  send_keys(str)   - keystrokes to game
-  start_new_game() - compatibility alias
-  save_game(slot)  - checkpoint to PostgreSQL
-  load_game(slot)  - restore checkpoint
-  list_saves()     - available checkpoints
-  delete_save()    - remove a checkpoint
-  game_status()    - is DCSS alive?
+A profile (``instance_id``) is a long-lived character/world line.
+A checkpoint (``slot``) is a named save inside that profile.
 """
 
-import os
-import sys
-import asyncio
-import signal
 import atexit
-import time
+import asyncio
 import logging
+import os
+import signal
+import sys
+import time
+
 from mcp.server.fastmcp import FastMCP
 
 from dcss_engine import DcssEngine
@@ -32,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server")
 
-SERVER_VERSION = "2026-08-11-tmux-crawl-v2"
+SERVER_VERSION = "2026-08-21-multi-profile-v1"
 DEPLOY_COMMIT = (
     os.environ.get("RENDER_GIT_COMMIT")
     or os.environ.get("RENDER_COMMIT")
@@ -42,20 +36,25 @@ DEPLOY_COMMIT = (
 
 MCP_INSTRUCTIONS = """
 This MCP server lets the assistant play Dungeon Crawl Stone Soup through tools.
-To begin a run, call start_game() first. Render may CPU-throttle Crawl during
-map initialization. If start_game() returns INITIALIZING, do NOT call
-start_game() again because that would throw away the progress; call
-read_screen() on the same session until the menu or game appears. After that,
-use read_screen() and send_keys(keys) to inspect the terminal and act in game.
-Do not merely explain the controls when the user asks to play; use the tools.
+Only one game is active at a time, but PostgreSQL can store multiple independent
+profiles and multiple checkpoints per profile.
+
+Use list_instances() or list_saves() before loading when the desired profile is
+unclear. A fresh game should have an instance_id (for example "Asterion" or
+"wizard-test"). save_game() defaults to checkpoint "latest" for the active
+profile. load_game(instance_id="Asterion", slot="latest") switches the live
+session to that profile without deleting any other database checkpoints.
+
+If start_game() or load_game() returns INITIALIZING, do not restart it; call
+read_screen() on the same session until the terminal appears.
 """
 
 mcp = FastMCP("DCSS Game Server", instructions=MCP_INSTRUCTIONS)
 engine = DcssEngine()
 pg = PgStore()
-_pending_autoplay: dict[str, str] | None = None
 
-# ── Tools ─────────────────────────────────────────────────────────────
+_pending_autoplay: dict[str, str] | None = None
+_active_instance: str | None = None
 
 SPECIAL_KEY_TOKENS = {
     "Backspace": "\x7f",
@@ -70,8 +69,27 @@ SPECIAL_KEY_TOKENS = {
 }
 
 
+def _clean_instance_id(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("instance_id must not be empty")
+    if "::" in value:
+        raise ValueError("instance_id must not contain '::'")
+    if len(value) > 60:
+        raise ValueError("instance_id is too long (max 60 characters)")
+    return value
+
+
+def _clean_slot(value: str) -> str:
+    value = (value or "latest").strip() or "latest"
+    if "::" in value:
+        raise ValueError("slot must not contain '::'")
+    if len(value) > 60:
+        raise ValueError("slot is too long (max 60 characters)")
+    return value
+
+
 def _normalize_keys(keys: str) -> str:
-    """Allow model-friendly key names such as TabTab, Space, and Enter."""
     if not keys:
         return ""
 
@@ -98,15 +116,57 @@ def _normalize_keys(keys: str) -> str:
     return "".join(out)
 
 
+def _infer_character(files: dict[str, bytes]) -> str | None:
+    cs_names = sorted(name for name in files if name.endswith(".cs"))
+    if not cs_names:
+        return None
+    return cs_names[0][:-3]
+
+
+def _save_meta(files: dict[str, bytes], instance_id: str) -> dict:
+    return {
+        "instance_id": instance_id,
+        "character": _infer_character(files) or instance_id,
+    }
+
+
+def _resolve_active_instance(
+    requested: str = "",
+    files: dict[str, bytes] | None = None,
+) -> str:
+    if requested.strip():
+        return _clean_instance_id(requested)
+    if _active_instance:
+        return _active_instance
+    if files:
+        inferred = _infer_character(files)
+        if inferred:
+            return _clean_instance_id(inferred)
+    raise ValueError(
+        "No active profile is known. Pass instance_id explicitly or load/start a profile first."
+    )
+
+
+def _format_saves(saves: list[dict]) -> str:
+    if not saves:
+        return "No saves found in database."
+    lines = ["Available DCSS saves:"]
+    for save in saves:
+        legacy = " [legacy]" if save.get("legacy") else ""
+        lines.append(
+            f"  [{save['instance_id']}/{save['slot']}] "
+            f"{save['character']} — {save['depth']} — {save['turns']} turns — "
+            f"{save['updated_at']}{legacy}"
+        )
+    return "\n".join(lines)
+
+
 def _finish_pending_autoplay(screen: str) -> str:
-    """Finish the old auto-play shortcut once delayed startup finally paints."""
     global _pending_autoplay
     if not _pending_autoplay or not screen.strip():
         return screen
 
     weapon = _pending_autoplay.get("weapon", "")
-    # This mirrors the previous behaviour: CLI options preselect the character,
-    # then Enter accepts the initial menu once it finally appears.
     engine.send_keys("\r")
     screen = engine.wait_for_stable(timeout=3.0)
     if weapon and "choice of weapons" in screen.lower():
@@ -122,11 +182,15 @@ async def _start_game_impl(
     species: str = "Mi",
     background: str = "Be",
     weapon: str = "c",
+    instance_id: str = "",
 ) -> str:
-    """Start Crawl without assuming Render can finish initialization quickly."""
-    global _pending_autoplay
+    global _pending_autoplay, _active_instance
+
+    new_instance = _clean_instance_id(instance_id or name or "default")
     engine.stop()
     engine.clean_save_files()
+    _active_instance = new_instance
+
     extra_args: list[str] = []
     if auto_play:
         extra_args = ["-name", name, "-species", species, "-background", background]
@@ -149,30 +213,23 @@ def _screen_or_blank_diagnostic(screen: str) -> str:
     elapsed = diag.get("startup_elapsed_sec")
     elapsed_text = f"{elapsed:.1f}s" if isinstance(elapsed, (int, float)) else "unknown"
 
-    # For the first two minutes, a blank terminal is now treated as a normal
-    # initialization state. Render runtime CPU can be much slower than image
-    # build CPU, and Crawl loads all map definitions before painting the menu.
     if isinstance(elapsed, (int, float)) and elapsed < 120:
         return (
-            f"INITIALIZING - DCSS process is alive but has not painted the terminal yet "
+            "INITIALIZING - DCSS process is alive but has not painted the terminal yet "
             f"(elapsed={elapsed_text}).\n"
-            "Do NOT call start_game() again; that would restart map initialization. "
-            "Call read_screen() again on this same session."
+            "Do NOT call start_game() again; call read_screen() on this same session."
         )
 
     lines = [
         "STARTUP STILL BLANK - DCSS process is alive but has not painted the terminal.",
         f"startup_elapsed={elapsed_text}",
         f"server_version={SERVER_VERSION} commit={DEPLOY_COMMIT}",
+        f"active_instance={_active_instance or '?'}",
         f"TERM={diag['term']} size={diag['cols']}x{diag['rows']} terminfo={diag['terminfo']}",
         f"binary={diag['binary']} realpath={diag['binary_realpath']}",
     ]
-    if diag["proc"]:
-        lines.append("proc:")
-        for key in ("tmux_pane", "cmdline", "status", "wchan", "cwd", "exe"):
-            value = diag["proc"].get(key)
-            if value:
-                lines.append(f"{key}: {value}")
+    if diag.get("proc"):
+        lines.append(f"proc: {diag['proc']}")
     if diag.get("process_table"):
         lines.append("process_table:")
         lines.append(diag["process_table"])
@@ -181,9 +238,8 @@ def _screen_or_blank_diagnostic(screen: str) -> str:
 
 @mcp.tool(
     description=(
-        "Read the current DCSS game screen as ASCII text (80x24 terminal). "
-        "If the process is still loading maps, returns INITIALIZING; keep using "
-        "read_screen() on the same session rather than restarting the game."
+        "Read the current DCSS screen as ASCII text. If startup is still blank, "
+        "keep calling read_screen() instead of restarting the game."
     )
 )
 async def read_screen() -> str:
@@ -197,12 +253,10 @@ async def read_screen() -> str:
 
 @mcp.tool(
     description=(
-        "Send keystrokes to DCSS and return the updated screen.\n\n"
-        "Common keys:  o=auto-explore  Tab=attack  g=pick-up  >=down-stairs  "
-        "<=up-stairs  5=wait  a=ability  S=save&quit  Space=more  y/n=confirm  "
-        ".=wait-one  q=quaff  d=drop item\n\n"
-        "Movement:  h/j/k/l = left/down/up/right  y/u/b/n = diagonals\n\n"
-        "Send multiple keys as a single string, e.g. '>>' or 'gg' or 'TabTab'."
+        "Send keystrokes to the active DCSS profile and return the updated screen. "
+        "Common keys: o=auto-explore, Tab=attack, g=pick-up, >=down-stairs, "
+        "<=up-stairs, 5=wait, a=ability, Space=more, y/n=confirm. "
+        "Movement: h/j/k/l and y/u/b/n diagonals."
     )
 )
 async def send_keys(keys: str = "") -> str:
@@ -210,15 +264,11 @@ async def send_keys(keys: str = "") -> str:
     if not engine.is_running:
         return "NO GAME RUNNING — use start_game(), start_new_game(), or load_game() first."
     if not keys:
-        screen = engine.read_screen()
-        if screen.strip() and _pending_autoplay:
-            screen = _finish_pending_autoplay(screen)
-        return _screen_or_blank_diagnostic(screen)
+        return await read_screen()
     try:
         _pending_autoplay = None
         engine.send_keys(_normalize_keys(keys))
-        screen = engine.wait_for_stable(timeout=2.0)
-        return _screen_or_blank_diagnostic(screen)
+        return _screen_or_blank_diagnostic(engine.wait_for_stable(timeout=2.0))
     except Exception as exc:
         logger.exception("send_keys failed")
         return f"ERROR: {exc}"
@@ -226,11 +276,10 @@ async def send_keys(keys: str = "") -> str:
 
 @mcp.tool(
     description=(
-        "Start a fresh DCSS game. Any current game is terminated first. Render "
-        "may take longer than a normal desktop to load Crawl's maps; if this "
-        "returns INITIALIZING, keep calling read_screen() and do not restart.\n\n"
-        "By default auto_play=true preselects a Minotaur Berserker. Set "
-        "auto_play=false to stop at the menu."
+        "Start a fresh DCSS profile. The live session is single-instance, so any "
+        "currently running game is stopped first, but database checkpoints for all "
+        "other profiles remain untouched. Give each long-lived character a distinct "
+        "instance_id. Set auto_play=false to stop at the main menu."
     )
 )
 async def start_game(
@@ -239,8 +288,8 @@ async def start_game(
     species: str = "Mi",
     background: str = "Be",
     weapon: str = "c",
+    instance_id: str = "",
 ) -> str:
-    """Start a fresh game, allowing initialization to continue asynchronously."""
     try:
         screen = await _start_game_impl(
             auto_play=auto_play,
@@ -248,8 +297,10 @@ async def start_game(
             species=species,
             background=background,
             weapon=weapon,
+            instance_id=instance_id,
         )
-        return _screen_or_blank_diagnostic(screen)
+        prefix = f"Active profile: {_active_instance}\n"
+        return prefix + _screen_or_blank_diagnostic(screen)
     except Exception as exc:
         logger.exception("start_game failed")
         return f"ERROR starting game: {exc}"
@@ -257,10 +308,8 @@ async def start_game(
 
 @mcp.tool(
     description=(
-        "Compatibility alias for start_game(). Starts a fresh DCSS game. "
-        "By default, it preselects a simple Minotaur Berserker, but you can "
-        "pass custom name/species/background/weapon. Use weapon='' to stop at "
-        "weapon selection, or auto_play=false to stop at the menu."
+        "Compatibility alias for start_game(). Give different long-lived characters "
+        "different instance_id values."
     )
 )
 async def start_new_game(
@@ -269,6 +318,7 @@ async def start_new_game(
     species: str = "Mi",
     background: str = "Be",
     weapon: str = "c",
+    instance_id: str = "",
 ) -> str:
     return await start_game(
         auto_play=auto_play,
@@ -276,30 +326,32 @@ async def start_new_game(
         species=species,
         background=background,
         weapon=weapon,
+        instance_id=instance_id,
     )
 
 
 @mcp.tool(
     description=(
-        "Save & quit the current game, then upload the save files to PostgreSQL "
-        "and restart the session so you can keep playing.\n\n"
-        "Use different 'slot' names for branching saves (e.g. 'before_lair', "
-        "'before_grinder').  Default slot is 'latest'."
+        "Save and quit the active game to PostgreSQL, then restart Crawl so play can "
+        "continue. instance_id identifies the long-lived profile; slot identifies a "
+        "checkpoint inside that profile. If instance_id is omitted, the active "
+        "profile is used. Examples: Asterion/latest, Asterion/before_lair."
     )
 )
-async def save_game(slot: str = "latest") -> str:
+async def save_game(slot: str = "latest", instance_id: str = "") -> str:
+    global _active_instance
     if not engine.is_running:
         return "No game running. Nothing to save."
-    try:
-        logger.info("Saving game to slot '%s' ...", slot)
 
-        # Ask DCSS to save & quit
+    try:
+        checkpoint = _clean_slot(slot)
+        logger.info("Saving active profile=%s slot=%s", _active_instance, checkpoint)
+
         engine.send_keys("S")
         await asyncio.sleep(1.5)
-        engine.send_keys("y")  # confirm "Save and quit? (y/N)"
+        engine.send_keys("y")
         await asyncio.sleep(1.0)
 
-        # If still running, quit to exit crawl completely
         if engine.is_running:
             screen = engine.read_screen()
             if "menu" in screen.lower() or "play" in screen.lower() or "quit" in screen.lower():
@@ -308,24 +360,28 @@ async def save_game(slot: str = "latest") -> str:
 
         engine.wait_for_exit(timeout=5.0)
         files = engine.collect_save_files()
-
-        if files:
-            pg.store(slot, files)
-            logger.info("Saved %d files to slot '%s'.", len(files), slot)
-
-            engine.restore_save_files(files)
+        if not files:
             engine.start()
-            screen = engine.read_screen()
-            return (
-                f"✓ Saved game to slot '{slot}' ({len(files)} files).\n"
-                f"Game process restarted.\n"
-                f"{_screen_or_blank_diagnostic(screen)}"
-            )
-        else:
-            engine.start()
-            screen = engine.read_screen()
-            return f"No save files found. Starting new game.\n{_screen_or_blank_diagnostic(screen)}"
+            return "No save files found. Crawl was restarted."
 
+        profile = _resolve_active_instance(instance_id, files)
+        _active_instance = profile
+        pg.store(
+            checkpoint,
+            files,
+            _save_meta(files, profile),
+            instance_id=profile,
+        )
+        logger.info("Saved %d files to profile=%s slot=%s", len(files), profile, checkpoint)
+
+        engine.restore_save_files(files)
+        engine.start()
+        screen = engine.read_screen()
+        return (
+            f"✓ Saved [{profile}/{checkpoint}] ({len(files)} files).\n"
+            "Game process restarted on the same profile.\n"
+            f"{_screen_or_blank_diagnostic(screen)}"
+        )
     except Exception as exc:
         logger.exception("save_game failed")
         engine.stop()
@@ -334,139 +390,170 @@ async def save_game(slot: str = "latest") -> str:
 
 @mcp.tool(
     description=(
-        "Load a saved-game checkpoint from PostgreSQL.\n\n"
-        "The save files are downloaded, written to the game directory, "
-        "and DCSS starts from that checkpoint."
+        "Load one database checkpoint and make it the active live profile. Prefer "
+        "load_game(instance_id='Asterion', slot='latest'). For backward compatibility "
+        "an old single-slot save can still be loaded with load_game(slot='Asterion')."
     )
 )
-async def load_game(slot: str = "latest") -> str:
+async def load_game(slot: str = "latest", instance_id: str = "") -> str:
+    global _active_instance, _pending_autoplay
     try:
-        files = pg.load(slot)
-        if not files:
-            saves = pg.list_saves()
-            msg = f"No save found in slot '{slot}'."
-            if saves:
-                names = "\n".join(f"  [{s['slot']}] {s['character']} — {s['depth']} — {s['turns']}turns"
-                                  for s in saves)
-                msg += f"\nAvailable saves:\n{names}"
-            return msg
+        checkpoint = _clean_slot(slot)
+        record = None
+
+        if instance_id.strip():
+            profile = _clean_instance_id(instance_id)
+            record = pg.load_record(slot=checkpoint, instance_id=profile)
+        elif _active_instance and checkpoint == "latest":
+            record = pg.load_record(slot=checkpoint, instance_id=_active_instance)
+
+        if record is None and not instance_id.strip():
+            record = pg.load_record(slot=checkpoint)
+
+        if not record:
+            saves = pg.list_saves(instance_id=instance_id or None)
+            return (
+                f"No save found for instance={instance_id or '?'} slot={checkpoint}.\n"
+                + _format_saves(saves)
+            )
 
         engine.stop()
         engine.clean_save_files()
-        engine.restore_save_files(files)
+        engine.restore_save_files(record["files"])
+        _active_instance = record["instance_id"]
+        _pending_autoplay = None
         engine.start()
-        return _screen_or_blank_diagnostic(engine.read_screen())
+
+        return (
+            f"✓ Loaded [{record['instance_id']}/{record['slot']}]"
+            + (" from legacy save." if record.get("legacy") else ".")
+            + "\n"
+            + _screen_or_blank_diagnostic(engine.read_screen())
+        )
     except Exception as exc:
         logger.exception("load_game failed")
         return f"ERROR loading game: {exc}"
 
 
 @mcp.tool(
-    description="List all available save checkpoints stored in PostgreSQL."
+    description=(
+        "List saved checkpoints. Optionally pass instance_id to show only one profile."
+    )
 )
-async def list_saves() -> str:
+async def list_saves(instance_id: str = "") -> str:
     try:
-        saves = pg.list_saves()
-        if not saves:
-            return "No saves found in database."
-        lines = ["Available saves:"]
-        for s in saves:
-            lines.append(
-                f"  [{s['slot']}] {s['character']} — "
-                f"{s['depth']} — {s['turns']} turns — {s['updated_at']}"
-            )
-        return "\n".join(lines)
+        saves = pg.list_saves(instance_id=instance_id or None)
+        return _format_saves(saves)
     except Exception as exc:
+        logger.exception("list_saves failed")
         return f"ERROR listing saves: {exc}"
 
 
 @mcp.tool(
-    description="Delete a saved-game checkpoint from PostgreSQL."
+    description="List long-lived DCSS profiles and how many checkpoints each has."
 )
-async def delete_save(slot: str) -> str:
+async def list_instances() -> str:
     try:
-        pg.delete(slot)
-        return f"Deleted save '{slot}'."
+        instances = pg.list_instances()
+        if not instances:
+            return "No DCSS profiles found in database."
+        lines = ["DCSS profiles:"]
+        for item in instances:
+            active = " ← ACTIVE" if (
+                _active_instance
+                and item["instance_id"].lower() == _active_instance.lower()
+            ) else ""
+            lines.append(
+                f"  {item['instance_id']} — {item['character']} — "
+                f"{item['checkpoint_count']} checkpoint(s) — "
+                f"newest {item['latest_checkpoint']} @ {item['updated_at']}{active}"
+            )
+        return "\n".join(lines)
     except Exception as exc:
+        logger.exception("list_instances failed")
+        return f"ERROR listing profiles: {exc}"
+
+
+@mcp.tool(
+    description=(
+        "Delete one database checkpoint. Pass both instance_id and slot for new "
+        "multi-profile saves. Legacy raw slots remain supported."
+    )
+)
+async def delete_save(slot: str = "latest", instance_id: str = "") -> str:
+    try:
+        deleted = pg.delete(
+            _clean_slot(slot),
+            instance_id=_clean_instance_id(instance_id) if instance_id.strip() else None,
+        )
+        if deleted:
+            label = f"{instance_id}/{slot}" if instance_id else slot
+            return f"Deleted save '{label}'."
+        return "No matching save was found."
+    except Exception as exc:
+        logger.exception("delete_save failed")
         return f"ERROR deleting save: {exc}"
 
 
 @mcp.tool(
     description=(
-        "Return server version, deployed commit, transport/runtime settings, "
-        "and DCSS engine diagnostics. Use this to verify which Render deploy "
-        "the MCP client is actually connected to."
+        "Return server version, active profile, transport/runtime settings, "
+        "and DCSS engine diagnostics."
     )
 )
 async def server_info() -> str:
     diag = engine.diagnostics()
-    lines = [
+    return "\n".join([
         f"DCSS MCP server version: {SERVER_VERSION}",
         f"Deploy commit: {DEPLOY_COMMIT}",
-        f"Render service: {os.environ.get('RENDER_SERVICE_NAME', '?')}",
-        f"Render instance: {os.environ.get('RENDER_INSTANCE_ID', '?')}",
+        f"Active profile: {_active_instance or '?'}",
         f"Backend: {diag.get('backend', '?')}",
         f"DCSS binary: {diag['binary']}",
         f"DCSS data dir: {diag.get('crawl_dir', '?')} exists={diag.get('crawl_dir_exists', '?')}",
-        f"DCSS binary realpath: {diag['binary_realpath']}",
-        f"DCSS binary exists/executable: {diag['binary_exists']}/{diag['binary_executable']}",
         f"tmux: {diag.get('tmux_binary', '?')} exists={diag.get('tmux_exists', '?')} session={diag.get('session', '?')}",
-        f"TERM: {diag['term']}  size: {diag['cols']}x{diag['rows']} terminfo={diag['terminfo']}",
+        f"TERM: {diag['term']} size={diag['cols']}x{diag['rows']} terminfo={diag['terminfo']}",
         f"Running: {diag['is_running']} startup_elapsed={diag.get('startup_elapsed_sec')}s",
         f"Screen nonblank chars: {diag['screen_nonblank_chars']}",
-    ]
-    if diag["proc"]:
-        lines.append("Process diagnostics:")
-        for key in ("tmux_pane", "cmdline", "status", "wchan", "cwd", "exe"):
-            value = diag["proc"].get(key)
-            if value:
-                lines.append(f"{key}: {value}")
-    if diag.get("process_table"):
-        lines.append("Process table:")
-        lines.append(diag["process_table"])
-    return "\n".join(lines)
+    ])
 
 
 @mcp.tool(
-    description="Quick check whether DCSS is running, initializing, or ready."
+    description="Quick check whether DCSS is running and which profile is active."
 )
 async def game_status() -> str:
-    prefix = f"DCSS MCP {SERVER_VERSION} commit={DEPLOY_COMMIT}\n"
+    prefix = (
+        f"DCSS MCP {SERVER_VERSION} commit={DEPLOY_COMMIT}\n"
+        f"active_profile={_active_instance or '?'}\n"
+    )
     diag = engine.diagnostics()
     if not engine.is_running:
-        return (
-            prefix
-            + "DCSS is NOT running.\n"
-            + f"binary={diag['binary']} realpath={diag['binary_realpath']} "
-            + f"exists/executable={diag['binary_exists']}/{diag['binary_executable']} "
-            + f"TERM={diag['term']} size={diag['cols']}x{diag['rows']}"
-        )
+        return prefix + "DCSS is NOT running."
+
     try:
         screen = engine.read_screen()
         if not screen.strip():
             return prefix + _screen_or_blank_diagnostic(screen)
         if len(screen) > 300:
-            return prefix + "DCSS is READY/RUNNING.\n" + f"(Preview)\n{screen[:300]}..."
+            return prefix + "DCSS is READY/RUNNING.\n(Preview)\n" + screen[:300] + "..."
         return prefix + "DCSS is READY/RUNNING.\n" + screen
     except Exception as exc:
         return prefix + f"DCSS is RUNNING but screen read error: {exc}"
 
-# ── Graceful shutdown — save game on SIGTERM ─────────────────────────
-
 
 @atexit.register
 def _save_on_exit():
-    """Best-effort save when the server stops."""
+    """Best-effort latest checkpoint for the active profile."""
+    global _active_instance
     if not engine.is_running:
+        pg.close()
         return
+
     try:
-        # If Crawl has not painted anything yet, it is still initializing and
-        # there is no game state to save. Do not inject keystrokes into startup.
         if not engine.read_screen().strip():
-            logger.info("Shutdown during Crawl initialization; stopping session without save.")
+            logger.info("Shutdown during Crawl initialization; stopping without save.")
             return
 
-        logger.info("Shutdown: saving game...")
+        logger.info("Shutdown: saving active profile...")
         engine.send_keys("S")
         time.sleep(1.5)
         engine.send_keys("y")
@@ -475,10 +562,18 @@ def _save_on_exit():
             engine.send_keys("Q")
             time.sleep(1.0)
         engine.wait_for_exit(timeout=4.0)
+
         files = engine.collect_save_files()
         if files:
-            pg.store("latest", files)
-            logger.info("Shutdown save complete.")
+            profile = _resolve_active_instance(files=files)
+            _active_instance = profile
+            pg.store(
+                "latest",
+                files,
+                _save_meta(files, profile),
+                instance_id=profile,
+            )
+            logger.info("Shutdown checkpoint complete: %s/latest", profile)
     except Exception as exc:
         logger.error("Shutdown save failed: %s", exc)
     finally:
@@ -487,14 +582,12 @@ def _save_on_exit():
 
 
 def _sigterm(signum, frame):
-    """SIGTERM → sys.exit → atexit handler runs above."""
     logger.warning("SIGTERM — saving and shutting down ...")
     sys.exit(0)
 
 
 signal.signal(signal.SIGTERM, _sigterm)
 
-# ── Entry point ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logger.info("===== DCSS MCP Server =====")
@@ -528,6 +621,7 @@ if __name__ == "__main__":
             "name": "DCSS Game Server",
             "version": SERVER_VERSION,
             "commit": DEPLOY_COMMIT,
+            "active_instance": _active_instance,
             "mcp": "/mcp",
             "sse": "/sse",
             "tools": [
@@ -538,6 +632,7 @@ if __name__ == "__main__":
                 "save_game",
                 "load_game",
                 "list_saves",
+                "list_instances",
                 "delete_save",
                 "server_info",
                 "game_status",
