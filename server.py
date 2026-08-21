@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server")
 
-SERVER_VERSION = "2026-08-21-multi-profile-v1"
+SERVER_VERSION = "2026-08-21-multi-profile-v2"
 DEPLOY_COMMIT = (
     os.environ.get("RENDER_GIT_COMMIT")
     or os.environ.get("RENDER_COMMIT")
@@ -35,18 +35,78 @@ DEPLOY_COMMIT = (
 )
 
 MCP_INSTRUCTIONS = """
-This MCP server lets the assistant play Dungeon Crawl Stone Soup through tools.
-Only one game is active at a time, but PostgreSQL can store multiple independent
-profiles and multiple checkpoints per profile.
+This MCP server lets the assistant actively play Dungeon Crawl Stone Soup through
+tools. Do not merely explain controls when the user asks to play: inspect the
+screen and use the game tools.
 
-Use list_instances() or list_saves() before loading when the desired profile is
-unclear. A fresh game should have an instance_id (for example "Asterion" or
-"wizard-test"). save_game() defaults to checkpoint "latest" for the active
-profile. load_game(instance_id="Asterion", slot="latest") switches the live
-session to that profile without deleting any other database checkpoints.
+SAVE / PROFILE MODEL
+- Only one Crawl game is live at a time, but PostgreSQL can hold any number of
+  independent profiles and checkpoints.
+- instance_id identifies a long-lived character/profile/world line, for example
+  "Asterion", "Grey", or "wizard-test".
+- slot identifies a checkpoint inside that profile, for example "latest",
+  "before_lair", or "before_boss".
+- Never create or overwrite another profile merely because the current chat
+  does not remember what was being played. If uncertain, call list_instances()
+  first, then list_saves(instance_id=...).
+- Never use start_game() to resume an existing character. Use load_game().
+- Before intentionally switching away from a live character with unsaved
+  progress, save it first, normally with save_game(slot="latest").
+- Do not delete checkpoints unless the user explicitly asks to delete them.
 
-If start_game() or load_game() returns INITIALIZING, do not restart it; call
-read_screen() on the same session until the terminal appears.
+CREATING A NEW CHARACTER / PROFILE
+Preferred path: use start_game(auto_play=true, instance_id="Grey", name="Grey",
+species="Mi", background="Be", weapon="c") with the desired choices. Give each
+long-lived character a distinct instance_id. start_game() stops the current live
+session and starts a fresh game; stored database checkpoints for other profiles
+remain intact.
+
+If manual character creation is needed, use start_game(auto_play=false,
+instance_id="...") and navigate from the terminal screen one step at a time:
+1. Call read_screen() and inspect what DCSS is actually showing.
+2. At the main menu / "Enter your name:" prompt, type the desired character name
+   and press Enter to choose the default "Dungeon Crawl" game when appropriate.
+3. At species, background, or weapon choice screens, read the displayed options
+   and send the letter/key printed beside the desired choice. Do not guess a
+   choice key when the current screen can be read.
+4. Space advances --more-- style prompts. Escape/Esc backs out or cancels where
+   DCSS offers that behaviour. Enter confirms the current/default choice where
+   the screen indicates it is appropriate.
+5. Keep reading the screen after each choice until the dungeon map appears.
+
+LOADING AN EXISTING CHARACTER
+1. If the desired character is not already known, call list_instances().
+2. Call list_saves(instance_id="Asterion") to inspect its checkpoints.
+3. Load with load_game(instance_id="Asterion", slot="latest") or another named
+   checkpoint.
+4. load_game() restores that checkpoint and starts Crawl, but DCSS may initially
+   show its main menu. When the screen shows the saved character and a line such
+   as "[tab] quick-load last game", send Tab to enter the restored game. Do not
+   choose New Game when resuming an existing profile.
+5. If load_game() returns INITIALIZING, call read_screen() on the same session
+   until a nonblank menu appears; then use Tab if the quick-load option is shown.
+
+SAVING / BRANCHING
+- save_game(slot="latest") saves the active character's normal current checkpoint.
+  instance_id may be omitted when the active profile is already known.
+- save_game(slot="before_lair") or another descriptive slot creates a branch /
+  checkpoint inside the same profile without overwriting its other checkpoints.
+- save_game() asks DCSS to save and quit, stores the files in PostgreSQL, restores
+  the same files locally, and restarts Crawl. It will normally return to the main
+  menu. To continue playing the same character, wait/read_screen() until the menu
+  is ready and send Tab when "quick-load last game" is offered.
+- Loading another profile switches the one live session but does not delete any
+  other stored profile or checkpoint.
+
+STARTUP / TERMINAL RULES
+- If start_game() or load_game() returns INITIALIZING, do NOT call start_game()
+  again. Repeatedly call read_screen() on the same session until the terminal
+  paints. Restarting would throw away the in-progress startup.
+- If a saved-games main menu is visible, Tab is the preferred quick-load key when
+  DCSS explicitly displays "[tab] quick-load last game".
+- For unfamiliar menus, prompts, confirmation dialogs, or character-creation
+  screens, always read_screen() first and follow the keys shown by DCSS instead
+  of relying on memory.
 """
 
 mcp = FastMCP("DCSS Game Server", instructions=MCP_INSTRUCTIONS)
